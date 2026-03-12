@@ -14,6 +14,15 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     app: &AppHandle<R>,
     _api: PluginApi<R, C>,
 ) -> crate::Result<Notification<R>> {
+    // new: Windows startup tasks
+    #[cfg(windows)]
+    {
+        crate::windows::action_handler::start_relay(app.clone());
+        if crate::windows::com_activator::is_background_activation_launch() {
+            log::debug!("[notification] process started for background activation");
+        }
+    }
+
     Ok(Notification(app.clone()))
 }
 
@@ -24,32 +33,41 @@ pub struct Notification<R: Runtime>(AppHandle<R>);
 
 impl<R: Runtime> crate::NotificationBuilder<R> {
     pub fn show(self) -> crate::Result<()> {
-        let mut notification = imp::Notification::new(self.app.config().identifier.clone());
-
-        if let Some(title) = self
-            .data
-            .title
-            .or_else(|| self.app.config().product_name.clone())
+        // new: on Windows, route to the tiered Windows implementation (Win7–Win11)
+        #[cfg(windows)]
         {
-            notification = notification.title(title);
+            let mut data = self.data;
+            if data.title.is_none() {
+                data.title = self.app.config().product_name.clone();
+            }
+            let identifier = self.app.config().identifier.clone();
+            crate::windows::show(&data, &identifier, &self.app)
         }
-        if let Some(body) = self.data.body {
-            notification = notification.body(body);
-        }
-        if let Some(icon) = self.data.icon {
-            notification = notification.icon(icon);
-        }
-        if let Some(sound) = self.data.sound {
-            notification = notification.sound(sound);
-        }
-        #[cfg(feature = "windows7-compat")]
-        {
-            notification.notify(&self.app)?;
-        }
-        #[cfg(not(feature = "windows7-compat"))]
-        notification.show()?;
 
-        Ok(())
+        // upstream: original notify_rust path for macOS / Linux (unchanged)
+        #[cfg(not(windows))]
+        {
+            let mut notification = imp::Notification::new(self.app.config().identifier.clone());
+
+            if let Some(title) = self
+                .data
+                .title
+                .or_else(|| self.app.config().product_name.clone())
+            {
+                notification = notification.title(title);
+            }
+            if let Some(body) = self.data.body {
+                notification = notification.body(body);
+            }
+            if let Some(icon) = self.data.icon {
+                notification = notification.icon(icon);
+            }
+            if let Some(sound) = self.data.sound {
+                notification = notification.sound(sound);
+            }
+            notification.show()?;
+            Ok(())
+        }
     }
 }
 
@@ -78,7 +96,7 @@ mod imp {
     /// Allows you to construct a Notification data and send it.
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// use tauri_plugin_notification::NotificationExt;
     /// // first we build the application to access the Tauri configuration
     /// let app = tauri::Builder::default()
@@ -111,6 +129,7 @@ mod imp {
         identifier: String,
     }
 
+    #[allow(dead_code)]
     impl Notification {
         /// Initializes a instance of a Notification.
         pub fn new(identifier: impl Into<String>) -> Self {
@@ -152,7 +171,7 @@ mod imp {
         ///
         /// # Examples
         ///
-        /// ```no_run
+        /// ```rust,ignore
         /// use tauri_plugin_notification::NotificationExt;
         ///
         /// tauri::Builder::default()

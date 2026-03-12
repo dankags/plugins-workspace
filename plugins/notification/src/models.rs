@@ -176,6 +176,36 @@ pub struct NotificationData {
     pub(crate) auto_cancel: bool,
     #[serde(default)]
     pub(crate) silent: bool,
+
+    // new: Windows 10+ fields
+    /// Notification tag — composite key with `group` for WinRT history API. Win10+ only.
+    pub(crate) tag: Option<String>,
+    /// Hero image at the top of the toast. Win10+ only.
+    pub(crate) hero_image: Option<String>,
+    /// Interactive action buttons. Win10+ only.
+    #[serde(default)]
+    pub(crate) windows_actions: Vec<WindowsAction>,
+    /// Text/selection inputs. Win10+ only.
+    #[serde(default)]
+    pub(crate) windows_inputs: Vec<WindowsInput>,
+    /// Progress bar. Win10 build 19041+ only.
+    pub(crate) progress: Option<WindowsProgress>,
+    /// Auto-remove after N milliseconds. Win10+ only.
+    pub(crate) expiry_ms: Option<u64>,
+    /// System-level presentation mode. Win10+ only.
+    pub(crate) scenario: Option<WindowsScenario>,
+
+    // new: Windows 11+ fields
+    /// Delivery priority. `Urgent` requires Win11+.
+    pub(crate) priority: Option<WindowsPriority>,
+    /// Remove from Action Center on reboot. Win11+ only.
+    #[serde(default)]
+    pub(crate) expires_on_reboot: bool,
+
+    // new: background COM activation
+    /// Enable background COM activation. Win8+ only.
+    #[serde(default)]
+    pub(crate) background_activation: bool,
 }
 
 fn default_id() -> i32 {
@@ -205,6 +235,16 @@ impl Default for NotificationData {
             ongoing: false,
             auto_cancel: false,
             silent: false,
+            tag: None,
+            hero_image: None,
+            windows_actions: Vec::new(),
+            windows_inputs: Vec::new(),
+            progress: None,
+            expiry_ms: None,
+            scenario: None,
+            priority: None,
+            expires_on_reboot: false,
+            background_activation: false,
         }
     }
 }
@@ -473,6 +513,317 @@ mod android {
 
         pub fn build(self) -> Channel {
             self.0
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// New: Windows-specific types
+// All types below are new additions — nothing above this line was changed
+// beyond the new fields added to NotificationData and its Default impl.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// An interactive button on a Windows 10+ toast notification.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsAction {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub action_type: WindowsActionType,
+    pub protocol: Option<String>,
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub placement: WindowsActionPlacement,
+    pub input_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowsActionType {
+    #[default]
+    Foreground,
+    Background,
+    Protocol,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowsActionPlacement {
+    #[default]
+    Default,
+    ContextMenu,
+}
+
+/// A text or selection input embedded in a Windows 10+ toast notification.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsInput {
+    pub id: String,
+    pub placeholder: Option<String>,
+    #[serde(default)]
+    pub input_type: WindowsInputType,
+    #[serde(default)]
+    pub selections: Vec<WindowsSelectionItem>,
+    pub default_selection: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowsInputType {
+    #[default]
+    Text,
+    Selection,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsSelectionItem {
+    pub id: String,
+    pub content: String,
+}
+
+/// Progress bar state for a long-running operation notification (Win10 19041+).
+/// Re-send with same tag + group to update the bar in place.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsProgress {
+    /// 0.0–1.0, or negative for an indeterminate (animated) bar.
+    pub value: f32,
+    pub title: Option<String>,
+    pub status: Option<String>,
+    pub value_string: Option<String>,
+}
+
+/// System-level notification presentation mode (Win10+).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowsScenario {
+    Default,
+    Alarm,
+    Reminder,
+    IncomingCall,
+    /// Win11 build 22000+ only; falls back to Reminder on Win10.
+    Urgent,
+}
+
+/// Notification delivery priority (Win10+).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowsPriority {
+    Default,
+    High,
+    /// Win11 build 22000+ only; falls back to High on Win10.
+    Urgent,
+}
+
+/// Payload of the `notification://action` Tauri event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationActionEvent {
+    pub action_id: String,
+    pub inputs: std::collections::HashMap<String, String>,
+    pub tag: Option<String>,
+    pub group: Option<String>,
+}
+
+/// A notification currently visible in the Windows Action Center.
+/// Returned by get_active_notifications. MSIX + Win10+ only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WinActiveNotification {
+    pub id: u32,
+    pub tag: Option<String>,
+    pub group: Option<String>,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub app_id: Option<String>,
+}
+
+/// Notification Listener access permission status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ListenerAccessStatus {
+    Allowed,
+    Denied,
+    Unspecified,
+    NotSupported,
+}
+
+/// Plugin config from tauri.conf.json → plugins → notification.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginConfig {
+    /// Stable GUID for COM background activation.
+    pub com_server_guid: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── PluginConfig serde ────────────────────────────────────────────────
+
+    #[test]
+    fn plugin_config_empty_object_gives_none_guid() {
+        let cfg: PluginConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.com_server_guid.is_none());
+    }
+
+    #[test]
+    fn plugin_config_parses_com_server_guid() {
+        let cfg: PluginConfig =
+            serde_json::from_str(r#"{"comServerGuid":"A3B4C5D6-E7F8-9012-ABCD-EF0123456789"}"#)
+                .unwrap();
+        assert_eq!(
+            cfg.com_server_guid.as_deref(),
+            Some("A3B4C5D6-E7F8-9012-ABCD-EF0123456789")
+        );
+    }
+
+    #[test]
+    fn plugin_config_null_guid_is_none() {
+        let cfg: PluginConfig = serde_json::from_str(r#"{"comServerGuid":null}"#).unwrap();
+        assert!(cfg.com_server_guid.is_none());
+    }
+
+    #[test]
+    fn plugin_config_round_trips() {
+        let original = PluginConfig {
+            com_server_guid: Some("GUID-XYZ".to_string()),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(original.com_server_guid, restored.com_server_guid);
+    }
+
+    // ── NotificationData default ──────────────────────────────────────────
+
+    #[test]
+    fn notification_data_default_has_sensible_values() {
+        let d = NotificationData::default();
+        assert!(d.title.is_none());
+        assert!(d.body.is_none());
+        assert!(d.windows_actions.is_empty());
+        assert!(d.windows_inputs.is_empty());
+        assert!(d.progress.is_none());
+        assert!(!d.silent);
+        assert!(!d.expires_on_reboot);
+        assert!(!d.background_activation);
+    }
+
+    // ── NotificationActionEvent serde ────────────────────────────────────
+
+    #[test]
+    fn action_event_round_trips() {
+        let mut inputs = HashMap::new();
+        inputs.insert("reply_box".to_string(), "Hello".to_string());
+
+        let ev = NotificationActionEvent {
+            action_id: "reply".to_string(),
+            inputs,
+            tag: Some("msg-1".to_string()),
+            group: Some("chat".to_string()),
+        };
+
+        let json = serde_json::to_string(&ev).unwrap();
+        let restored: NotificationActionEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.action_id, "reply");
+        assert_eq!(
+            restored.inputs.get("reply_box").map(|s| s.as_str()),
+            Some("Hello")
+        );
+        assert_eq!(restored.tag.as_deref(), Some("msg-1"));
+        assert_eq!(restored.group.as_deref(), Some("chat"));
+    }
+
+    #[test]
+    fn action_event_missing_optional_fields_deserializes() {
+        let json = r#"{"actionId":"tap","inputs":{}}"#;
+        let ev: NotificationActionEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(ev.action_id, "tap");
+        assert!(ev.tag.is_none());
+        assert!(ev.group.is_none());
+    }
+
+    // ── WinActiveNotification serde ───────────────────────────────────────
+
+    #[test]
+    fn win_active_notification_round_trips() {
+        let n = WinActiveNotification {
+            id: 42,
+            tag: Some("tag-1".to_string()),
+            group: Some("grp-1".to_string()),
+            title: Some("Hello".to_string()),
+            body: Some("World".to_string()),
+            app_id: Some("com.example.app".to_string()),
+        };
+        let json = serde_json::to_string(&n).unwrap();
+        let r: WinActiveNotification = serde_json::from_str(&json).unwrap();
+        assert_eq!(r.id, 42);
+        assert_eq!(r.title.as_deref(), Some("Hello"));
+        assert_eq!(r.app_id.as_deref(), Some("com.example.app"));
+    }
+
+    // ── ListenerAccessStatus serde ────────────────────────────────────────
+
+    #[test]
+    fn listener_access_status_round_trips_all_variants() {
+        for status in [
+            ListenerAccessStatus::Allowed,
+            ListenerAccessStatus::Denied,
+            ListenerAccessStatus::Unspecified,
+            ListenerAccessStatus::NotSupported,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let r: ListenerAccessStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(r, status);
+        }
+    }
+
+    // ── WindowsAction serde ───────────────────────────────────────────────
+
+    #[test]
+    fn windows_action_type_defaults_to_foreground() {
+        let json = r#"{"id":"a","label":"A","placement":"default"}"#;
+        let a: WindowsAction = serde_json::from_str(json).unwrap();
+        assert_eq!(a.action_type, WindowsActionType::Foreground);
+    }
+
+    #[test]
+    fn windows_action_background_type_parses() {
+        let json = r#"{"id":"a","label":"A","actionType":"background","placement":"default"}"#;
+        let a: WindowsAction = serde_json::from_str(json).unwrap();
+        assert_eq!(a.action_type, WindowsActionType::Background);
+    }
+
+    // ── WindowsProgress serde ─────────────────────────────────────────────
+
+    #[test]
+    fn windows_progress_round_trips() {
+        let p = WindowsProgress {
+            value: 0.75,
+            title: Some("Uploading".to_string()),
+            status: Some("In progress".to_string()),
+            value_string: Some("75%".to_string()),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let r: WindowsProgress = serde_json::from_str(&json).unwrap();
+        assert!((r.value - 0.75).abs() < f32::EPSILON);
+        assert_eq!(r.title.as_deref(), Some("Uploading"));
+    }
+
+    // ── WindowsScenario serde ─────────────────────────────────────────────
+
+    #[test]
+    fn windows_scenario_all_variants_round_trip() {
+        let variants = ["default", "alarm", "reminder", "incomingCall", "urgent"];
+        for s in variants {
+            let json = format!(r#""{s}""#);
+            let v: WindowsScenario = serde_json::from_str(&json).unwrap();
+            let back = serde_json::to_string(&v).unwrap();
+            assert_eq!(back, json, "round-trip failed for scenario '{s}'");
         }
     }
 }

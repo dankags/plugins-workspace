@@ -13,7 +13,7 @@ links = "tauri-plugin-notification"
 targets = ["x86_64-unknown-linux-gnu", "x86_64-linux-android"]
 
 [package.metadata.platforms.support]
-windows = { level = "full", notes = "Only works for installed apps. Shows powershell name & icon in development." }
+windows = { level = "full", notes = "Windows 7-11. Rich adaptive toasts on Win10+. Background COM activation and Notification Listener require MSIX packaging." }
 linux = { level = "full", notes = "" }
 macos = { level = "full", notes = "" }
 android = { level = "full", notes = "" }
@@ -37,8 +37,40 @@ serde_repr = "0.1"
 tauri = { workspace = true, features = ["wry"] }
 
 [target."cfg(windows)".dependencies]
-win7-notifications = { version = "0.4.5", optional = true }
-windows-version = { version = "0.1", optional = true }
+# was optional (windows7-compat only); now always compiled for runtime tier detection
+win7-notifications = "0.4.5"
+windows-version = "0.1"
+
+# windows-sys for raw COM vtable implementation in com_activator.rs.
+# Using windows-sys avoids the proc-macro version conflict that occurs when
+# windows-core is pulled in at multiple versions by transitive dependencies.
+[target."cfg(windows)".dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Storage_Packaging_Appx",
+]
+
+[target."cfg(windows)".dependencies.windows-core]
+version = "0.62.2"
+features = [
+
+]
+
+[target."cfg(windows)".dependencies.windows]
+version = "0.61.2"
+features = [
+    "UI_Notifications",
+    "UI_Notifications_Management",
+    "Data_Xml_Dom",
+    "Foundation",
+    "Foundation_Collections",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_UI_Shell",
+    "Win32_System_WinRT",
+    "ApplicationModel"
+    ]
 
 [target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\"))".dependencies]
 notify-rust = "4.11"
@@ -49,4 +81,5 @@ ctor = "0.2"
 maplit = "1"
 
 [features]
-windows7-compat = ["win7-notifications", "windows-version"]
+# kept as a no-op shim for backward compat; Win7 support is now always compiled in
+windows7-compat = []
