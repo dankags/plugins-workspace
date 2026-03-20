@@ -225,7 +225,10 @@ fn build_audio(data: &NotificationData) -> String {
         // "silent" sentinel string
         Some("silent") => "<audio silent=\"true\"/>".to_string(),
         // Named Windows notification sound — maps to ms-winsoundevent namespace
-        Some(s) => format!("<audio src=\"ms-winsoundevent:Notification.{s}\" loop=\"false\"/>"),
+        Some(s) => format!(
+            "<audio src=\"ms-winsoundevent:Notification.{}\" loop=\"false\"/>",
+            esc(s)
+        ),
     }
 }
 

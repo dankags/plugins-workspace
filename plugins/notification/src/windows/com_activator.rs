@@ -31,7 +31,7 @@ use crate::windows::action_handler;
 type Bool = windows_sys::core::BOOL;
 
 /// Token returned by `CoRegisterClassObject`; kept alive for the process lifetime.
-static COM_REGISTRATION_TOKEN: OnceLock<Mutex<u32>> = OnceLock::new();
+static COM_REGISTRATION_TOKEN: OnceLock<Result<Mutex<u32>, String>> = OnceLock::new();
 
 // ── GUIDs ─────────────────────────────────────────────────────────────────
 
@@ -146,36 +146,43 @@ unsafe extern "system" fn activator_activate(
     data: *const NotificationUserInputData,
     count: u32,
 ) -> Hresult {
-    let action_id = if invoked_args.is_null() {
-        String::new()
-    } else {
-        pcwstr_to_string(invoked_args)
-    };
+    let result = std::panic::catch_unwind(|| {
+        let action_id = if invoked_args.is_null() {
+            String::new()
+        } else {
+            pcwstr_to_string(invoked_args)
+        };
 
-    let mut inputs = std::collections::HashMap::new();
-    if !data.is_null() && count > 0 {
-        let slice = std::slice::from_raw_parts(data, count as usize);
-        for item in slice {
-            let key = if item.key.is_null() {
-                String::new()
-            } else {
-                pcwstr_to_string(item.key)
-            };
-            let val = if item.value.is_null() {
-                String::new()
-            } else {
-                pcwstr_to_string(item.value)
-            };
-            inputs.insert(key, val);
+        let mut inputs = std::collections::HashMap::new();
+        if !data.is_null() && count > 0 {
+            let slice = std::slice::from_raw_parts(data, count as usize);
+            for item in slice {
+                let key = if item.key.is_null() {
+                    String::new()
+                } else {
+                    pcwstr_to_string(item.key)
+                };
+                let val = if item.value.is_null() {
+                    String::new()
+                } else {
+                    pcwstr_to_string(item.value)
+                };
+                inputs.insert(key, val);
+            }
         }
-    }
 
-    action_handler::dispatch(crate::models::NotificationActionEvent {
-        action_id,
-        inputs,
-        tag: None,
-        group: None,
+        action_handler::dispatch(crate::models::NotificationActionEvent {
+            action_id,
+            inputs,
+            tag: None,
+            group: None,
+        });
     });
+
+    if result.is_err() {
+        log::error!("[notification] panic in COM activator callback");
+        return windows_sys::Win32::Foundation::E_FAIL;
+    }
 
     S_OK
 }
@@ -277,37 +284,32 @@ unsafe extern "system" fn factory_lock_server(_this: *mut c_void, _lock: Bool) -
 
 /// Register the COM activator factory. Idempotent — safe to call multiple times.
 pub fn register(guid_str: &str) -> crate::Result<()> {
-    if COM_REGISTRATION_TOKEN.get().is_some() {
-        return Ok(());
-    }
-
     let guid =
         parse_guid(guid_str).map_err(|_| crate::Error::InvalidComGuid(guid_str.to_string()))?;
 
-    unsafe {
-        CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32);
+    COM_REGISTRATION_TOKEN
+        .get_or_init(|| unsafe {
+            CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32);
 
-        let factory_ptr = std::ptr::addr_of_mut!(FACTORY_INSTANCE) as *mut c_void;
+            let factory_ptr = std::ptr::addr_of_mut!(FACTORY_INSTANCE) as *mut c_void;
 
-        let mut token: u32 = 0;
-        let hr = CoRegisterClassObject(
-            &guid,
-            factory_ptr,
-            CLSCTX_LOCAL_SERVER,
-            REGCLS_MULTIPLEUSE as u32,
-            &mut token,
-        );
+            let mut token: u32 = 0;
+            let hr = CoRegisterClassObject(
+                &guid,
+                factory_ptr,
+                CLSCTX_LOCAL_SERVER,
+                REGCLS_MULTIPLEUSE as u32,
+                &mut token,
+            );
 
-        if hr != S_OK {
-            return Err(crate::Error::Windows(format!(
-                "CoRegisterClassObject failed: HRESULT {hr:#010x}"
-            )));
-        }
+            if hr != S_OK {
+                return Err(format!("CoRegisterClassObject failed: HRESULT {hr:#010x}"));
+            }
 
-        COM_REGISTRATION_TOKEN
-            .set(Mutex::new(token))
-            .map_err(|_| crate::Error::ComAlreadyRegistered)?;
-    }
+            Ok(Mutex::new(token))
+        })
+        .as_ref()
+        .map_err(|e| crate::Error::Windows(e.clone()))?;
 
     log::debug!("[notification] COM activator registered (GUID={guid_str})");
     Ok(())
@@ -315,7 +317,7 @@ pub fn register(guid_str: &str) -> crate::Result<()> {
 
 /// Unregister the COM factory.
 pub fn unregister() {
-    if let Some(m) = COM_REGISTRATION_TOKEN.get() {
+    if let Some(Ok(m)) = COM_REGISTRATION_TOKEN.get() {
         if let Ok(token) = m.lock() {
             unsafe {
                 CoRevokeClassObject(*token);
@@ -323,7 +325,6 @@ pub fn unregister() {
         }
     }
 }
-
 /// Returns `true` if the process was launched by Windows for background activation.
 pub fn is_background_activation_launch() -> bool {
     std::env::args().any(|a| a == "----BackgroundActivated")

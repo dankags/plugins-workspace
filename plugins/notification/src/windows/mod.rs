@@ -72,7 +72,9 @@ mod tier {
                 if let Some(icon) = app_clone.default_window_icon() {
                     n.icon(icon.rgba().to_vec(), icon.width(), icon.height());
                 }
-                let _ = n.show();
+                if let Err(e) = n.show() {
+                    log::warn!("[notification] win7 notification failed to show: {}", e);
+                }
             })
             .map_err(|_| crate::Error::MainThread)?;
             Ok(())
@@ -181,10 +183,12 @@ mod tier {
             // cast to IReference<DateTime> via the Interface trait.
             if ver.has_expiry() {
                 if let Some(ms) = data.expiry_ms {
-                    if let Ok(prop) = PropertyValue::CreateDateTime(ms_to_winrt_datetime(ms)) {
-                        if let Ok(iref) = prop.cast::<IReference<DateTime>>() {
-                            let _ = toast.SetExpirationTime(&iref);
-                        }
+                    match PropertyValue::CreateDateTime(ms_to_winrt_datetime(ms))
+                        .and_then(|prop| prop.cast::<IReference<DateTime>>())
+                        .and_then(|iref| toast.SetExpirationTime(&iref))
+                    {
+                        Ok(_) => {}
+                        Err(e) => log::debug!("[notification] failed to set expiry: {}", e),
                     }
                 }
             }
