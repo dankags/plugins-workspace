@@ -215,20 +215,27 @@ pub(crate) fn esc(s: &str) -> String {
 }
 
 /// Build the `<audio>` element from the notification's sound / silent fields.
+// In xml_builder.rs — find the audio element builder
 fn build_audio(data: &NotificationData) -> String {
     if data.silent {
         return "<audio silent=\"true\"/>".to_string();
     }
-    match data.sound.as_deref() {
-        // No sound specified → let Windows use the system default (no element needed)
-        None | Some("") => String::new(),
-        // "silent" sentinel string
-        Some("silent") => "<audio silent=\"true\"/>".to_string(),
-        // Named Windows notification sound — maps to ms-winsoundevent namespace
-        Some(s) => format!(
-            "<audio src=\"ms-winsoundevent:Notification.{}\" loop=\"false\"/>",
-            esc(s)
-        ),
+
+    match &data.sound {
+        None => String::new(),
+        Some(sound) => {
+            // If it looks like a file path or ends in .wav — treat as custom sound
+            if sound.ends_with(".wav") || sound.contains('\\') || sound.contains('/') {
+                // Resolve the bundled resource path at runtime
+                format!("<audio src=\"{}\" loop=\"false\"/>", esc(sound))
+            } else {
+                // Standard ms-winsoundevent name e.g. "Mail", "Reminder"
+                format!(
+                    "<audio src=\"ms-winsoundevent:Notification.{}\" loop=\"false\"/>",
+                    esc(sound)
+                )
+            }
+        }
     }
 }
 
