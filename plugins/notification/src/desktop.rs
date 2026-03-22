@@ -17,7 +17,9 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     // new: Windows startup tasks
     #[cfg(windows)]
     {
+        println!("[notification] desktop::init called — starting relay");
         crate::windows::action_handler::start_relay(app.clone());
+        println!("[notification] ✅ relay started");
         if crate::windows::com_activator::is_background_activation_launch() {
             println!("[notification] process started for background activation");
         }
