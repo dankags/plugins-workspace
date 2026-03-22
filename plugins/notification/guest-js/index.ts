@@ -459,29 +459,26 @@ async function requestPermission(): Promise<NotificationPermission> {
  * @since 2.0.0
  */
 function sendNotification(options: Options | string): void {
-  // On Windows, we need to invoke directly so the full rich options
-  // (windowsActions, windowsInputs, progress, etc.) are serialised and sent
-  // to the Rust tier dispatch. window.Notification only passes title+body.
-  //
-  // __TEMPLATE_windows__ is replaced by Rust at injection time with
-  // true or false, so this branch is resolved at runtime per platform.
-  //
-  // @ts-expect-error __TEMPLATE_windows__ is replaced by Rust before injection
-  if (__TEMPLATE_windows__) {
-    if (typeof options === 'string') {
-      void invoke('plugin:notification|notify', { options: { title: options } })
-    } else {
-      const frozen = Object.freeze({ ...options })
-      void invoke('plugin:notification|notify', { options: frozen })
-    }
+  // SSR guard — Tauri's invoke() requires a browser context (window + __TAURI_INTERNALS__).
+  // This function is a no-op on the server. Call it only from client components
+  // or inside useEffect / event handlers.
+  if (typeof window === 'undefined') {
+    console.warn(
+      '[tauri-plugin-notification] sendNotification() was called during SSR.\n'
+        + 'This is a no-op. Move the call inside a useEffect() or an event handler\n'
+        + 'to ensure it only runs on the client side.\n'
+        + 'Example:\n'
+        + '  useEffect(() => { sendNotification(...) }, [])'
+    )
     return
   }
 
-  // Original upstream path — used on macOS, Linux, iOS, Android
   if (typeof options === 'string') {
-    new window.Notification(options)
+    void invoke('plugin:notification|notify', { options: { title: options } })
   } else {
-    new window.Notification(options.title, options)
+    void invoke('plugin:notification|notify', {
+      options: Object.freeze({ ...options })
+    })
   }
 }
 

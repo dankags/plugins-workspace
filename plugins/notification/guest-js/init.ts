@@ -43,14 +43,22 @@ declare global {
   interface Window {
     __TAURI_INTERNALS__: TauriInternals
     __TAURI_NOTIFICATION__: TauriNotificationApi
+    // Set by this IIFE after __TEMPLATE_windows__ is resolved by Rust.
+    // index.ts reads this instead of referencing __TEMPLATE_windows__ directly,
+    // because index.ts is bundled by Next.js which does not perform the Rust
+    // string-replace and would throw ReferenceError.
+    __TAURI_NOTIFICATION_WINDOWS__: boolean
   }
 }
 
 // ── IIFE ──────────────────────────────────────────────────────────────────────
 
 ;(function () {
+  console.log('NOTIFICATION INIT IIFE LOADED')
   let permissionSettable = false
   let permissionValue = 'default'
+
+  console.log('WINDOWS TEMPLATE VALUE:', '__TEMPLATE_windows__')
 
   // ── Permission helpers (unchanged from upstream) ──────────────────────
 
@@ -179,6 +187,12 @@ declare global {
     onNotificationAction
   }
 
+  // ── Expose Windows flag for index.ts ──────────────────────────────────
+  // index.ts is bundled by Next.js which does not perform the Rust
+  // string-replace on __TEMPLATE_windows__, so it cannot reference that
+  // variable directly. We resolve it here (inside the IIFE that Rust DOES
+  // process) and write the boolean result onto window so index.ts can read it.
+
   // ── Init: sync permission state on load (unchanged from upstream) ─────
 
   void isPermissionGranted().then(function (response) {
@@ -188,4 +202,7 @@ declare global {
       setNotificationPermission(response ? 'granted' : 'denied')
     }
   })
+
+  // @ts-expect-error __TEMPLATE_windows__ is replaced by Rust before injection
+  window.__TAURI_NOTIFICATION_WINDOWS__ = !!__TEMPLATE_windows__
 })()

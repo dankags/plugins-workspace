@@ -309,10 +309,21 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             #[cfg(windows)]
             {
                 let config: PluginConfig = api.config().clone();
+                println!(
+                    "[notification] comServerGuid = {:?}",
+                    config.com_server_guid
+                );
                 if let Some(ref guid) = config.com_server_guid {
-                    if let Err(e) = crate::windows::com_activator::register(guid) {
-                        log::warn!("[notification] COM activator registration failed: {e}");
+                    match crate::windows::com_activator::register(guid) {
+                        Ok(()) => println!("[notification] ✅ COM activator registered: {guid}"),
+                        Err(e) => {
+                            println!("[notification] ❌ COM activator registration failed: {e}")
+                        }
                     }
+                } else {
+                    println!(
+                        "[notification] ❌ No comServerGuid in config — actions will not fire"
+                    );
                 }
             }
 

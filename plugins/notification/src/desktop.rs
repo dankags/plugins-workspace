@@ -19,7 +19,7 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     {
         crate::windows::action_handler::start_relay(app.clone());
         if crate::windows::com_activator::is_background_activation_launch() {
-            log::debug!("[notification] process started for background activation");
+            println!("[notification] process started for background activation");
         }
     }
 
