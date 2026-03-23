@@ -49,7 +49,11 @@ pub(crate) async fn clear_notification<R: Runtime>(
     #[cfg(windows)]
     {
         let identifier = app.config().identifier.clone();
-        crate::windows::notification_listener::remove_notification(&identifier, &tag, &group)
+        crate::windows_platform::notification_listener::remove_notification(
+            &identifier,
+            &tag,
+            &group,
+        )
     }
     #[cfg(not(windows))]
     {
@@ -66,7 +70,10 @@ pub(crate) async fn clear_notification_group<R: Runtime>(
     #[cfg(windows)]
     {
         let identifier = app.config().identifier.clone();
-        crate::windows::notification_listener::remove_notification_group(&identifier, &group)
+        crate::windows_platform::notification_listener::remove_notification_group(
+            &identifier,
+            &group,
+        )
     }
     #[cfg(not(windows))]
     {
@@ -80,7 +87,7 @@ pub(crate) async fn clear_all_notifications<R: Runtime>(app: AppHandle<R>) -> Re
     #[cfg(windows)]
     {
         let identifier = app.config().identifier.clone();
-        crate::windows::notification_listener::remove_all_notifications(&identifier)
+        crate::windows_platform::notification_listener::remove_all_notifications(&identifier)
     }
     #[cfg(not(windows))]
     {
@@ -97,7 +104,7 @@ pub(crate) async fn request_listener_access<R: Runtime>(
 ) -> Result<crate::models::ListenerAccessStatus> {
     #[cfg(windows)]
     {
-        crate::windows::notification_listener::request_access().await
+        crate::windows_platform::notification_listener::request_access().await
     }
     #[cfg(not(windows))]
     {
@@ -111,7 +118,7 @@ pub(crate) async fn get_listener_access_status<R: Runtime>(
 ) -> Result<crate::models::ListenerAccessStatus> {
     #[cfg(windows)]
     {
-        crate::windows::notification_listener::get_access_status()
+        crate::windows_platform::notification_listener::get_access_status()
     }
     #[cfg(not(windows))]
     {
@@ -125,7 +132,7 @@ pub(crate) async fn get_active_notifications<R: Runtime>(
 ) -> Result<Vec<crate::models::WinActiveNotification>> {
     #[cfg(windows)]
     {
-        crate::windows::notification_listener::get_all_notifications().await
+        crate::windows_platform::notification_listener::get_all_notifications().await
     }
     #[cfg(not(windows))]
     {

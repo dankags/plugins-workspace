@@ -26,7 +26,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::windows::action_handler;
+use crate::windows_platform::action_handler;
 
 type Bool = windows_sys::core::BOOL;
 
@@ -500,7 +500,7 @@ mod extended_tests {
     fn background_activation_absent_in_normal_test_process() {
         // The test binary is not launched by Windows for background activation,
         // so this must return false.
-        assert!(!super::is_background_activation_launch());
+        assert!(!is_background_activation_launch());
     }
 
     // ── register: rejects invalid GUIDs before touching COM ──────────────

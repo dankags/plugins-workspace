@@ -18,6 +18,7 @@ use tauri::{
     plugin::{Builder, TauriPlugin},
     Manager, Runtime,
 };
+use windows::core::GUID;
 
 pub use models::*;
 pub use tauri::plugin::PermissionState;
@@ -33,7 +34,7 @@ mod models;
 
 // new: Windows-specific modules
 #[cfg(windows)]
-pub(crate) mod windows;
+pub(crate) mod windows_platform;
 
 pub use error::{Error, Result};
 
@@ -308,22 +309,37 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             // new: read plugin config and register COM activator on Windows
             #[cfg(windows)]
             {
-                let config: PluginConfig = api.config().clone();
-                println!(
-                    "[notification] comServerGuid = {:?}",
-                    config.com_server_guid
-                );
-                if let Some(ref guid) = config.com_server_guid {
-                    match crate::windows::com_activator::register(guid) {
-                        Ok(()) => println!("[notification] ✅ COM activator registered: {guid}"),
-                        Err(e) => {
-                            println!("[notification] ❌ COM activator registration failed: {e}")
-                        }
-                    }
-                } else {
-                    println!(
-                        "[notification] ❌ No comServerGuid in config — actions will not fire"
+                if !windows_platform::com_activator::is_background_activation_launch() {
+                    let config: PluginConfig = api.config().clone();
+                    log::debug!(
+                        "[notification] comServerGuid = {:?}",
+                        config.com_server_guid
                     );
+
+                    let guid: Option<GUID> = config
+                        .com_server_guid
+                        .as_deref()
+                        .map(windows_platform::com_activator::parse_guid)
+                        .transpose()
+                        .map_err(|e| tauri::Error::Anyhow(anyhow::anyhow!(e)))?;
+
+                    if let Some(ref guid) = guid {
+                        match crate::windows_platform::com_activator::register(guid) {
+                            Ok(()) => log::debug!(
+                                "[notification] ✅ COM activator registered: {}",
+                                config.com_server_guid.as_deref().unwrap_or("none")
+                            ),
+                            Err(e) => {
+                                log::error!(
+                                    "[notification] ❌ COM activator registration failed: {e}"
+                                )
+                            }
+                        }
+                    } else {
+                        log::warn!(
+                            "[notification] ❌ No comServerGuid in config — actions will not fire"
+                        );
+                    }
                 }
             }
 
@@ -339,7 +355,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             // the class object registration cleanly.
             if let tauri::RunEvent::Exit = event {
                 #[cfg(windows)]
-                crate::windows::com_activator::unregister();
+                crate::windows_platform::com_activator::unregister();
             }
         })
         .build()

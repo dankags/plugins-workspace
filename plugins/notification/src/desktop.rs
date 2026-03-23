@@ -18,9 +18,9 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     #[cfg(windows)]
     {
         println!("[notification] desktop::init called — starting relay");
-        crate::windows::action_handler::start_relay(app.clone());
+        crate::windows_platform::action_handler::start_relay(app.clone());
         println!("[notification] ✅ relay started");
-        if crate::windows::com_activator::is_background_activation_launch() {
+        if crate::windows_platform::com_activator_legacy::is_background_activation_launch() {
             println!("[notification] process started for background activation");
         }
     }
@@ -43,7 +43,7 @@ impl<R: Runtime> crate::NotificationBuilder<R> {
                 data.title = self.app.config().product_name.clone();
             }
             let identifier = self.app.config().identifier.clone();
-            crate::windows::show(&data, &identifier, &self.app)
+            crate::windows_platform::show(&data, &identifier, &self.app)
         }
 
         // upstream: original notify_rust path for macOS / Linux (unchanged)

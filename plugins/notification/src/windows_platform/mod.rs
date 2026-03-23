@@ -17,6 +17,7 @@
 
 pub mod action_handler;
 pub mod com_activator;
+pub mod com_activator_legacy;
 pub mod notification_listener;
 pub mod version;
 pub mod xml_builder;

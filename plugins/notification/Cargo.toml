@@ -32,6 +32,7 @@ rand = "0.9"
 time = { version = "0.3", features = ["serde", "parsing", "formatting"] }
 url = { version = "2", features = ["serde"] }
 serde_repr = "0.1"
+anyhow = "1.0.102"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 tauri = { workspace = true, features = ["wry"] }
@@ -45,11 +46,12 @@ windows-version = "0.1"
 # Using windows-sys avoids the proc-macro version conflict that occurs when
 # windows-core is pulled in at multiple versions by transitive dependencies.
 [target."cfg(windows)".dependencies.windows-sys]
-version = "0.61"
+version = "0.61.2"
 features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_Storage_Packaging_Appx",
+
 ]
 
 [target."cfg(windows)".dependencies.windows-core]
@@ -59,9 +61,8 @@ features = [
 ]
 
 [target."cfg(windows)".dependencies.windows]
-version = "0.61.2"
+version = "0.62.0"
 features = [
-    "UI_Notifications",
     "UI_Notifications_Management",
     "Data_Xml_Dom",
     "Foundation",
@@ -69,7 +70,10 @@ features = [
     "Win32_Storage_Packaging_Appx",
     "Win32_UI_Shell",
     "Win32_System_WinRT",
-    "ApplicationModel"
+    "ApplicationModel",
+    "UI_Notifications",
+    "Win32_System_Com",
+    "Win32_UI_Notifications"
     ]
 
 [target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\"))".dependencies]

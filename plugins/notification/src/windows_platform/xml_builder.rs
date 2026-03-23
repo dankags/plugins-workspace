@@ -48,6 +48,17 @@ pub fn build(data: &NotificationData, ver: WindowsVersion) -> crate::Result<Stri
             }
         }
     }
+    // Encode tag and group into the launch args so Activate() can recover them
+    let mut launch_parts = Vec::new();
+    if let Some(ref tag) = data.tag {
+        launch_parts.push(format!("tag={}", esc(tag)));
+    }
+    if let Some(ref group) = data.group {
+        launch_parts.push(format!("group={}", esc(group)));
+    }
+    if !launch_parts.is_empty() {
+        xml.push_str(&format!(" launch=\"{}\"", launch_parts.join("&amp;")));
+    }
     xml.push('>');
 
     // ── <visual> ──────────────────────────────────────────────────────────
@@ -167,8 +178,21 @@ pub fn build(data: &NotificationData, ver: WindowsVersion) -> crate::Result<Stri
                 WindowsActionType::Foreground => "foreground",
             };
 
-            // Protocol actions use the URI as the argument; others use `id`
-            let args = action.protocol.as_deref().unwrap_or(&action.id);
+            // Protocol actions use the URI verbatim; others encode as key=value
+            // so Activate() can recover action_id, tag, and group.
+            let base_args = action.protocol.as_deref().unwrap_or(&action.id);
+            let args = if action.action_type != WindowsActionType::Protocol {
+                let mut parts = vec![format!("action={}", base_args)];
+                if let Some(ref tag) = data.tag {
+                    parts.push(format!("tag={}", tag));
+                }
+                if let Some(ref group) = data.group {
+                    parts.push(format!("group={}", group));
+                }
+                parts.join("&")
+            } else {
+                base_args.to_string()
+            };
 
             let icon_attr = action
                 .icon
@@ -192,7 +216,7 @@ pub fn build(data: &NotificationData, ver: WindowsVersion) -> crate::Result<Stri
                 "<action content=\"{}\" arguments=\"{}\" \
                  activationType=\"{activation}\"{icon_attr}{placement_attr}{hint_input_id}/>",
                 esc(&action.label),
-                esc(args),
+                esc(&args),
             ));
         }
 
@@ -224,12 +248,13 @@ fn build_audio(data: &NotificationData) -> String {
     match &data.sound {
         None => String::new(),
         Some(sound) => {
-            // If it looks like a file path or ends in .wav — treat as custom sound
+            // Treat the string "silent" as a silent flag
+            if sound.eq_ignore_ascii_case("silent") {
+                return "<audio silent=\"true\"/>".to_string();
+            }
             if sound.ends_with(".wav") || sound.contains('\\') || sound.contains('/') {
-                // Resolve the bundled resource path at runtime
                 format!("<audio src=\"{}\" loop=\"false\"/>", esc(sound))
             } else {
-                // Standard ms-winsoundevent name e.g. "Mail", "Reminder"
                 format!(
                     "<audio src=\"ms-winsoundevent:Notification.{}\" loop=\"false\"/>",
                     esc(sound)
@@ -715,7 +740,11 @@ mod tests {
         assert!(xml.contains("<actions>"), "must open <actions>");
         assert!(xml.contains("</actions>"), "must close </actions>");
         assert!(xml.contains(r#"content="Dismiss""#));
-        assert!(xml.contains(r#"arguments="dismiss""#));
+        // Arguments are now encoded as key=value
+        assert!(
+            xml.contains("action=dismiss"),
+            "action id must be encoded as action=<id>"
+        );
         assert!(xml.contains(r#"activationType="background""#));
     }
 
@@ -744,9 +773,10 @@ mod tests {
             xml.contains("https://example.com"),
             "URI must be the argument for protocol actions"
         );
+        // Protocol actions pass the URI verbatim — no action= encoding
         assert!(
-            !xml.contains(r#"arguments="link""#),
-            "id must not be argument when protocol is set"
+            !xml.contains("action=link"),
+            "protocol action must not use key=value encoding"
         );
     }
 
@@ -916,5 +946,164 @@ mod tests {
         assert_eq!(xml.matches("</visual>").count(), 1);
         assert_eq!(xml.matches("<binding").count(), 1);
         assert_eq!(xml.matches("</binding>").count(), 1);
+    }
+
+    // ── launch attribute — tag/group round-trip ───────────────────────────
+
+    #[test]
+    fn launch_attribute_absent_when_no_tag_or_group() {
+        let xml = build(&data("t", "b"), WindowsVersion::Win10).unwrap();
+        assert!(
+            !xml.contains("launch="),
+            "launch attribute must not appear when tag and group are both None"
+        );
+    }
+
+    #[test]
+    fn launch_attribute_encodes_tag_only() {
+        let d = NotificationData {
+            title: Some("t".into()),
+            tag: Some("msg-123".into()),
+            ..Default::default()
+        };
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        assert!(xml.contains("launch="), "launch attribute must be present");
+        assert!(xml.contains("tag=msg-123"), "tag must be encoded in launch");
+        assert!(!xml.contains("group="), "group must not appear when None");
+    }
+
+    #[test]
+    fn launch_attribute_encodes_group_only() {
+        let d = NotificationData {
+            title: Some("t".into()),
+            group: Some("chat".into()),
+            ..Default::default()
+        };
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        assert!(xml.contains("launch="), "launch attribute must be present");
+        assert!(
+            xml.contains("group=chat"),
+            "group must be encoded in launch"
+        );
+        assert!(!xml.contains("tag="), "tag must not appear when None");
+    }
+
+    #[test]
+    fn launch_attribute_encodes_both_tag_and_group() {
+        let d = NotificationData {
+            title: Some("t".into()),
+            tag: Some("msg-123".into()),
+            group: Some("chat".into()),
+            ..Default::default()
+        };
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        assert!(xml.contains("tag=msg-123"), "tag must be in launch");
+        assert!(xml.contains("group=chat"), "group must be in launch");
+    }
+
+    #[test]
+    fn launch_tag_group_are_xml_escaped() {
+        let d = NotificationData {
+            title: Some("t".into()),
+            tag: Some("a&b".into()),
+            group: Some("<grp>".into()),
+            ..Default::default()
+        };
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        assert!(xml.contains("tag=a&amp;b"), "tag value must be XML-escaped");
+        assert!(
+            xml.contains("group=&lt;grp&gt;"),
+            "group value must be XML-escaped"
+        );
+    }
+
+    // ── action arguments encode tag/group ────────────────────────────────
+
+    #[test]
+    fn action_arguments_include_tag_and_group_when_set() {
+        let mut d = NotificationData {
+            title: Some("t".into()),
+            tag: Some("msg-123".into()),
+            group: Some("chat".into()),
+            ..Default::default()
+        };
+        d.windows_actions = vec![bg_action("reply", "Reply")];
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        assert!(
+            xml.contains("action=reply"),
+            "action id must be in arguments"
+        );
+        assert!(
+            xml.contains("tag=msg-123"),
+            "tag must be in action arguments"
+        );
+        assert!(
+            xml.contains("group=chat"),
+            "group must be in action arguments"
+        );
+    }
+
+    #[test]
+    fn action_arguments_omit_tag_group_when_absent() {
+        let mut d = data("t", "b");
+        d.windows_actions = vec![bg_action("dismiss", "Dismiss")];
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        assert!(xml.contains("action=dismiss"));
+        // No tag= or group= should appear anywhere in the arguments
+        let args_start = xml.find("arguments=").expect("arguments attr missing");
+        let args_end = xml[args_start..].find('"').unwrap() + args_start;
+        let args_end = xml[args_end + 1..].find('"').unwrap() + args_end + 1;
+        let args_slice = &xml[args_start..=args_end];
+        assert!(
+            !args_slice.contains("tag="),
+            "tag must not appear when None"
+        );
+        assert!(
+            !args_slice.contains("group="),
+            "group must not appear when None"
+        );
+    }
+
+    #[test]
+    fn protocol_action_arguments_never_encoded_with_tag_group() {
+        // Protocol actions pass URI verbatim — tag/group are NOT appended
+        let mut d = NotificationData {
+            title: Some("t".into()),
+            tag: Some("msg-123".into()),
+            group: Some("chat".into()),
+            ..Default::default()
+        };
+        d.windows_actions = vec![WindowsAction {
+            action_type: WindowsActionType::Protocol,
+            protocol: Some("https://example.com".into()),
+            ..bg_action("link", "Visit")
+        }];
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        // The URI must appear as the argument, not action= encoding
+        assert!(xml.contains("https://example.com"));
+        assert!(!xml.contains("action=link"));
+    }
+
+    #[test]
+    fn multiple_actions_all_carry_tag_and_group() {
+        let mut d = NotificationData {
+            title: Some("t".into()),
+            tag: Some("t1".into()),
+            group: Some("g1".into()),
+            ..Default::default()
+        };
+        d.windows_actions = vec![bg_action("yes", "Yes"), bg_action("no", "No")];
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        // tag=t1 appears in: launch attr (1) + each action's arguments (2) = 3 total
+        assert_eq!(
+            xml.matches("tag=t1").count(),
+            3,
+            "tag must appear in launch attr and each action's arguments"
+        );
+        assert_eq!(
+            xml.matches("group=g1").count(),
+            3,
+            "group must appear in launch attr and each action's arguments"
+        );
     }
 }
