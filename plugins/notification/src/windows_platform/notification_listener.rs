@@ -46,11 +46,10 @@ pub async fn request_access() -> crate::Result<ListenerAccessStatus> {
             .map_err(|e| crate::Error::Windows(e.to_string()))?;
 
         // Break the chain so rustc can infer the async output type at each step.
-        let op = listener
+        let status: UserNotificationListenerAccessStatus = listener
             .RequestAccessAsync()
-            .map_err(|e| crate::Error::Windows(e.to_string()))?;
-        let status: UserNotificationListenerAccessStatus = op
-            .GetResults()
+            .map_err(|e| crate::Error::Windows(e.to_string()))?
+            .await
             .map_err(|e| crate::Error::Windows(e.to_string()))?;
 
         Ok(winrt_status_to_model(status))
@@ -110,11 +109,10 @@ pub async fn get_all_notifications() -> crate::Result<Vec<WinActiveNotification>
         }
 
         // GetNotificationsAsync returns IAsyncOperation<IVectorView<UserNotification>>
-        let op = listener
+        let notifications = listener
             .GetNotificationsAsync(NotificationKinds::Toast)
-            .map_err(|e| crate::Error::Windows(e.to_string()))?;
-        let notifications = op
-            .GetResults()
+            .map_err(|e| crate::Error::Windows(e.to_string()))?
+            .await
             .map_err(|e| crate::Error::Windows(e.to_string()))?;
 
         let count = notifications

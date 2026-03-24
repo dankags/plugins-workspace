@@ -18,6 +18,7 @@ use tauri::{
     plugin::{Builder, TauriPlugin},
     Manager, Runtime,
 };
+#[cfg(windows)]
 use windows::core::GUID;
 
 pub use models::*;

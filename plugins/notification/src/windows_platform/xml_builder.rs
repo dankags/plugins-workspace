@@ -122,7 +122,12 @@ pub fn build(data: &NotificationData, ver: WindowsVersion) -> crate::Result<Stri
     // ── <audio> ───────────────────────────────────────────────────────────
     // Win8+ supports <audio>; Win7 uses a different mechanism entirely.
     if ver.has_winrt_toast() {
-        xml.push_str(&build_audio(data));
+        let is_looping = ver.has_scenario()
+            && matches!(
+                data.scenario,
+                Some(WindowsScenario::Alarm) | Some(WindowsScenario::Reminder)
+            );
+        xml.push_str(&build_audio(data, is_looping));
     }
 
     // ── <actions> (Win10+) ────────────────────────────────────────────────
@@ -180,18 +185,20 @@ pub fn build(data: &NotificationData, ver: WindowsVersion) -> crate::Result<Stri
 
             // Protocol actions use the URI verbatim; others encode as key=value
             // so Activate() can recover action_id, tag, and group.
-            let base_args = action.protocol.as_deref().unwrap_or(&action.id);
+            // Non-protocol actions always use action.id directly, even if a
+            // protocol field happens to be set on the action.
             let args = if action.action_type != WindowsActionType::Protocol {
-                let mut parts = vec![format!("action={}", base_args)];
+                let mut parts = vec![format!("action={}", esc(&action.id))];
                 if let Some(ref tag) = data.tag {
-                    parts.push(format!("tag={}", tag));
+                    parts.push(format!("tag={}", esc(tag)));
                 }
                 if let Some(ref group) = data.group {
-                    parts.push(format!("group={}", group));
+                    parts.push(format!("group={}", esc(group)));
                 }
-                parts.join("&")
+                // Join with XML-encoded & so the attribute value stays valid.
+                parts.join("&amp;")
             } else {
-                base_args.to_string()
+                action.protocol.as_deref().unwrap_or(&action.id).to_string()
             };
 
             let icon_attr = action
@@ -216,7 +223,13 @@ pub fn build(data: &NotificationData, ver: WindowsVersion) -> crate::Result<Stri
                 "<action content=\"{}\" arguments=\"{}\" \
                  activationType=\"{activation}\"{icon_attr}{placement_attr}{hint_input_id}/>",
                 esc(&action.label),
-                esc(&args),
+                // Non-protocol args are pre-escaped (esc applied per-part, & → &amp;).
+                // Protocol URIs are passed through esc here for attribute safety.
+                if action.action_type == WindowsActionType::Protocol {
+                    esc(&args)
+                } else {
+                    args
+                },
             ));
         }
 
@@ -239,24 +252,37 @@ pub(crate) fn esc(s: &str) -> String {
 }
 
 /// Build the `<audio>` element from the notification's sound / silent fields.
-// In xml_builder.rs — find the audio element builder
-fn build_audio(data: &NotificationData) -> String {
+/// `is_looping` should be true for alarm and reminder scenarios, which use
+/// `duration="long"` and require the audio to loop for the duration.
+fn build_audio(data: &NotificationData, is_looping: bool) -> String {
     if data.silent {
         return "<audio silent=\"true\"/>".to_string();
     }
 
+    let loop_attr = if is_looping { "true" } else { "false" };
+
     match &data.sound {
-        None => String::new(),
+        None => {
+            // For looping scenarios with no explicit sound, emit a looping
+            // alarm sound so the audio persists with the duration="long" toast.
+            if is_looping {
+                format!(
+                    "<audio src=\"ms-winsoundevent:Notification.Looping.Alarm\" loop=\"{loop_attr}\"/>"
+                )
+            } else {
+                String::new()
+            }
+        }
         Some(sound) => {
             // Treat the string "silent" as a silent flag
             if sound.eq_ignore_ascii_case("silent") {
                 return "<audio silent=\"true\"/>".to_string();
             }
             if sound.ends_with(".wav") || sound.contains('\\') || sound.contains('/') {
-                format!("<audio src=\"{}\" loop=\"false\"/>", esc(sound))
+                format!("<audio src=\"{}\" loop=\"{loop_attr}\"/>", esc(sound))
             } else {
                 format!(
-                    "<audio src=\"ms-winsoundevent:Notification.{}\" loop=\"false\"/>",
+                    "<audio src=\"ms-winsoundevent:Notification.{}\" loop=\"{loop_attr}\"/>",
                     esc(sound)
                 )
             }
@@ -493,6 +519,70 @@ mod tests {
         };
         let xml = build(&d, WindowsVersion::Win7).unwrap();
         assert!(!xml.contains("<audio"), "Win7 must not emit <audio>");
+    }
+
+    #[test]
+    fn alarm_scenario_loops_audio() {
+        let d = NotificationData {
+            scenario: Some(WindowsScenario::Alarm),
+            sound: Some("Mail".into()),
+            ..Default::default()
+        };
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        assert!(xml.contains(r#"loop="true""#), "alarm must loop audio");
+    }
+
+    #[test]
+    fn reminder_scenario_loops_audio() {
+        let d = NotificationData {
+            scenario: Some(WindowsScenario::Reminder),
+            sound: Some("Reminder".into()),
+            ..Default::default()
+        };
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        assert!(xml.contains(r#"loop="true""#), "reminder must loop audio");
+    }
+
+    #[test]
+    fn alarm_with_no_sound_emits_looping_default() {
+        let d = NotificationData {
+            scenario: Some(WindowsScenario::Alarm),
+            ..Default::default()
+        };
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        assert!(
+            xml.contains("<audio"),
+            "alarm with no sound must emit audio element"
+        );
+        assert!(
+            xml.contains("Looping.Alarm"),
+            "must use looping alarm sound"
+        );
+        assert!(xml.contains(r#"loop="true""#));
+    }
+
+    #[test]
+    fn incoming_call_scenario_does_not_loop_audio() {
+        let d = NotificationData {
+            scenario: Some(WindowsScenario::IncomingCall),
+            sound: Some("Call".into()),
+            ..Default::default()
+        };
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        assert!(
+            xml.contains(r#"loop="false""#),
+            "incomingCall must not loop audio"
+        );
+    }
+
+    #[test]
+    fn no_scenario_does_not_loop_audio() {
+        let d = NotificationData {
+            sound: Some("Mail".into()),
+            ..Default::default()
+        };
+        let xml = build(&d, WindowsVersion::Win10).unwrap();
+        assert!(xml.contains(r#"loop="false""#));
     }
 
     // ── Hero image ────────────────────────────────────────────────────────
@@ -1033,6 +1123,7 @@ mod tests {
             xml.contains("action=reply"),
             "action id must be in arguments"
         );
+        // Parts are joined with &amp; and each value is esc()-ed
         assert!(
             xml.contains("tag=msg-123"),
             "tag must be in action arguments"
@@ -1040,6 +1131,11 @@ mod tests {
         assert!(
             xml.contains("group=chat"),
             "group must be in action arguments"
+        );
+        // Separator must be &amp; not raw & to keep the XML attribute valid
+        assert!(
+            xml.contains("action=reply&amp;tag="),
+            "parts must be joined with &amp;"
         );
     }
 
