@@ -87,7 +87,7 @@ impl From<NotificationActionEvent> for ActivationEvent {
 ///
 /// Accepts:
 /// - Full URI: `myapp://notification?action=reply&tag=foo&group=bar`
-/// - Raw query: `action=reply&tag=foo&group=bar`  
+/// - Raw query: `action=reply&tag=foo&group=bar`
 /// - Plain action id: `dismiss`
 pub fn parse_activation_uri(raw: &str) -> ActivationEvent {
     let query = extract_query(raw);
@@ -125,13 +125,27 @@ pub fn to_action_event(e: ActivationEvent) -> NotificationActionEvent {
 #[cfg(all(windows, feature = "deep-link"))]
 pub fn register_deep_link_handler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     use tauri::Emitter;
+    use tauri_plugin_deep_link::DeepLinkExt;
 
-    let app = app.clone();
-    tauri_plugin_deep_link::register(move |urls| {
-        for url in urls {
+    let app_handle = app.clone();
+
+    // 1) Handle launch-via-notification (app was closed, OS spawned it with URL as argv)
+    if let Ok(Some(urls)) = app.deep_link().get_current() {
+        for url in &urls {
             let ev = parse_activation_uri(url.as_str());
             let action_ev = to_action_event(ev);
             if let Err(e) = app.emit(super::action_handler::EVENT_NAME, &action_ev) {
+                log::error!("[notification] initial deep-link emit failed: {e}");
+            }
+        }
+    }
+
+    // 2) Handle notification clicks while app is already running
+    app.deep_link().on_open_url(move |event| {
+        for url in event.urls() {
+            let ev = parse_activation_uri(url.as_str());
+            let action_ev = to_action_event(ev);
+            if let Err(e) = app_handle.emit(super::action_handler::EVENT_NAME, &action_ev) {
                 log::error!("[notification] deep-link emit failed: {e}");
             }
         }

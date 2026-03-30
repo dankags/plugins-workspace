@@ -23,7 +23,7 @@ ios = { level = "full", notes = "" }
 tauri-plugin = { workspace = true, features = ["build"] }
 
 [dependencies]
-serde = { workspace = true }
+serde.workspace = true
 serde_json = { workspace = true }
 tauri = { workspace = true }
 log = { workspace = true }
@@ -33,6 +33,7 @@ time = { version = "0.3", features = ["serde", "parsing", "formatting"] }
 url = { version = "2", features = ["serde"] }
 serde_repr = "0.1"
 anyhow = "1.0.102"
+tauri-plugin-deep-link = { version = "2.4.7", path = "../deep-link", optional = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 tauri = { workspace = true, features = ["wry"] }
@@ -95,3 +96,4 @@ maplit = "1"
 [features]
 # kept as a no-op shim for backward compat; Win7 support is now always compiled in
 windows7-compat = []
+deep-link = ["dep:tauri-plugin-deep-link"]

@@ -25,30 +25,13 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
         let result = std::panic::catch_unwind(|| {
             let raw_args = unsafe { invoked_args.to_string().unwrap_or_default() };
 
-            // Parse "action=foo&tag=bar&group=baz" — also handles plain action ids
-            // that don't use key=value encoding (e.g. protocol activations)
-            let mut params: std::collections::HashMap<String, String> = raw_args
-                .split('&')
-                .filter_map(|pair| {
-                    let mut it = pair.splitn(2, '=');
-                    let key = it.next()?.to_string();
-                    let val = it.next().unwrap_or("").to_string();
-                    Some((key, val))
-                })
-                .collect();
+            // Delegate all parsing to activation_bridge so the logic is
+            // centralised and consistent with the foreground / deep-link path.
+            let ev = crate::windows_platform::activation_bridge::parse_background_args(&raw_args);
 
-            // If "action" key is present use it; otherwise the whole string is the id
-            // (covers plain dismiss / body-click where launch attr has no key=value)
-            let action_id = params
-                .remove("action")
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| raw_args.clone());
-
-            let tag = params.remove("tag").filter(|s| !s.is_empty());
-            let group = params.remove("group").filter(|s| !s.is_empty());
-
-            // Collect user inputs from the data array
-            let mut inputs = std::collections::HashMap::new();
+            // Collect user inputs from the NOTIFICATION_USER_INPUT_DATA array.
+            // These are not available via the URI args — they come separately.
+            let mut inputs = ev.inputs;
             if !data.is_null() && count > 0 {
                 unsafe {
                     let slice = std::slice::from_raw_parts(data, count as usize);
@@ -61,12 +44,9 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
             }
 
             crate::windows_platform::action_handler::dispatch(
-                crate::models::NotificationActionEvent {
-                    action_id,
-                    inputs,
-                    tag,
-                    group,
-                },
+                crate::windows_platform::activation_bridge::to_action_event(
+                    crate::windows_platform::activation_bridge::ActivationEvent { inputs, ..ev },
+                ),
             );
         });
 
@@ -160,14 +140,6 @@ pub fn unregister() {
             }
         }
     }
-}
-
-//
-// Background activation detection
-//
-
-pub fn is_background_activation_launch() -> bool {
-    std::env::args().any(|a| a == "----BackgroundActivated")
 }
 
 /// Parse a GUID string in the standard registry format:

@@ -17,11 +17,13 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     // new: Windows startup tasks
     #[cfg(windows)]
     {
-        println!("[notification] desktop::init called — starting relay");
         crate::windows_platform::action_handler::start_relay(app.clone());
-        println!("[notification] ✅ relay started");
-        if crate::windows_platform::com_activator_legacy::is_background_activation_launch() {
-            println!("[notification] process started for background activation");
+
+        if crate::windows_platform::background_activation::is_background_activation_launch() {
+            log::info!("[notification] process started for background activation — running pump");
+            // Keep the process alive until Windows delivers the COM Activate() callback.
+            // The COM server is registered in lib.rs setup() before desktop::init() runs.
+            crate::windows_platform::background_activation::run_pump(5000);
         }
     }
 

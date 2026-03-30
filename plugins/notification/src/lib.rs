@@ -301,46 +301,98 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             commands::request_listener_access,
             commands::get_listener_access_status,
             commands::get_active_notifications,
+            // new: uninstall / cleanup
+            commands::uninstall_notification_registration,
+            commands::remove_notification_shortcut,
         ])
         .js_init_script(include_str!("init-iife.js").replace(
             "__TEMPLATE_windows__",
             if cfg!(windows) { "true" } else { "false" },
         ))
         .setup(|app, api| {
-            // new: read plugin config and register COM activator on Windows
             #[cfg(windows)]
             {
-                if !windows_platform::com_activator::is_background_activation_launch() {
-                    let config: PluginConfig = api.config().clone();
+                let config: PluginConfig = api.config().clone();
+
+                // Store config as managed state so uninstall commands can read it.
+                app.manage(config.clone());
+
+                let is_bg =
+                    windows_platform::background_activation::is_background_activation_launch();
+
+                // ── COM activator registration ────────────────────────────
+                if !is_bg {
                     log::debug!(
                         "[notification] comServerGuid = {:?}",
                         config.com_server_guid
                     );
+                }
 
-                    let guid: Option<GUID> = config
-                        .com_server_guid
-                        .as_deref()
-                        .map(windows_platform::com_activator::parse_guid)
-                        .transpose()
-                        .map_err(|e| tauri::Error::Anyhow(anyhow::anyhow!(e)))?;
+                let guid: Option<GUID> = config
+                    .com_server_guid
+                    .as_deref()
+                    .map(windows_platform::com_activator::parse_guid)
+                    .transpose()
+                    .map_err(|e| tauri::Error::Anyhow(anyhow::anyhow!(e)))?;
 
-                    if let Some(ref guid) = guid {
-                        match crate::windows_platform::com_activator::register(guid) {
-                            Ok(()) => log::debug!(
-                                "[notification] ✅ COM activator registered: {}",
-                                config.com_server_guid.as_deref().unwrap_or("none")
-                            ),
-                            Err(e) => {
-                                log::error!(
-                                    "[notification] ❌ COM activator registration failed: {e}"
-                                )
-                            }
+                if let Some(ref guid) = guid {
+                    match crate::windows_platform::com_activator::register(guid) {
+                        Ok(()) => log::debug!(
+                            "[notification] ✅ COM activator registered: {}",
+                            config.com_server_guid.as_deref().unwrap_or("none")
+                        ),
+                        Err(e) => {
+                            log::error!("[notification] ❌ COM activator registration failed: {e}")
                         }
-                    } else {
-                        log::warn!(
-                            "[notification] ❌ No comServerGuid in config — actions will not fire"
-                        );
                     }
+                } else {
+                    log::warn!(
+                        "[notification] ❌ No comServerGuid in config — actions will not fire"
+                    );
+                }
+
+                // ── Registry + shortcut (foreground launch only) ──────────
+                // Skip during background activation — we only need the COM
+                // server alive; writing registry/shortcut is not needed and
+                // would slow down the tight callback window.
+                if !is_bg {
+                    let aumid = app.config().identifier.clone();
+                    let display_name = app
+                        .config()
+                        .product_name
+                        .clone()
+                        .unwrap_or_else(|| aumid.clone());
+
+                    if let Some(ref guid_str) = config.com_server_guid {
+                        let reg_config = windows_platform::registry_installer::RegistryConfig {
+                            com_server_guid: guid_str.clone(),
+                            aumid: aumid.clone(),
+                            display_name: display_name.clone(),
+                            icon_path: None,
+                            exe_path: None, // defaults to current_exe()
+                        };
+
+                        if let Err(e) = windows_platform::registry_installer::install(&reg_config) {
+                            log::warn!("[notification] registry install failed: {e}");
+                        }
+
+                        let shortcut_config = windows_platform::shortcut_creator::ShortcutConfig {
+                            shortcut_name: display_name,
+                            aumid,
+                            com_server_guid: Some(guid_str.clone()),
+                            exe_path: None,
+                        };
+
+                        if let Err(e) =
+                            windows_platform::shortcut_creator::create_or_update(&shortcut_config)
+                        {
+                            log::warn!("[notification] shortcut create failed: {e}");
+                        }
+                    }
+
+                    // ── Deep-link handler (foreground activations) ────────
+                    #[cfg(feature = "deep-link")]
+                    windows_platform::activation_bridge::register_deep_link_handler(app);
                 }
             }
 

@@ -139,3 +139,78 @@ pub(crate) async fn get_active_notifications<R: Runtime>(
         Ok(vec![])
     }
 }
+
+// ── new: Windows uninstall / cleanup ─────────────────────────────────────────
+
+/// Remove the registry entries (COM server + AUMID) written during install.
+///
+/// Call this from your app's uninstaller — not on normal exit.
+/// Requires `comServerGuid` to be present in the plugin config.
+#[command]
+pub(crate) async fn uninstall_notification_registration<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use crate::windows_platform::registry_installer;
+        use tauri::Manager;
+
+        let config = app
+            .try_state::<crate::PluginConfig>()
+            .map(|s: tauri::State<crate::PluginConfig>| s.inner().clone())
+            .unwrap_or_default();
+
+        let guid_str: String = match config.com_server_guid {
+            Some(g) => g,
+            None => return Ok(()),
+        };
+
+        let aumid = app.config().identifier.clone();
+        let display_name = app
+            .config()
+            .product_name
+            .clone()
+            .unwrap_or_else(|| aumid.clone());
+
+        let reg_config = registry_installer::RegistryConfig {
+            com_server_guid: guid_str,
+            aumid,
+            display_name,
+            icon_path: None,
+            exe_path: None,
+        };
+
+        registry_installer::uninstall(&reg_config)?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Ok(())
+    }
+}
+
+/// Remove the Start Menu shortcut written during install.
+///
+/// Call this from your app's uninstaller — not on normal exit.
+#[command]
+pub(crate) async fn remove_notification_shortcut<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use crate::windows_platform::shortcut_creator;
+
+        let display_name = app
+            .config()
+            .product_name
+            .clone()
+            .unwrap_or_else(|| app.config().identifier.clone());
+
+        shortcut_creator::remove(&display_name)?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Ok(())
+    }
+}

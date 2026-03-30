@@ -24,12 +24,6 @@
 //!   `PKEY_AppUserModel_ToastActivatorCLSID` (pid 26)
 //!
 
-use windows::Win32::{
-    Foundation::PROPERTYKEY,
-    System::{Com::StructuredStorage::PROPVARIANT, Variant::VT_LPWSTR},
-};
-use windows_core::Interface;
-
 /// Configuration for shortcut creation.
 #[derive(Debug, Clone)]
 pub struct ShortcutConfig {
