@@ -317,6 +317,10 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 // Store config as managed state so uninstall commands can read it.
                 app.manage(config.clone());
 
+                // Start the relay thread immediately — needed on both foreground
+                // and background launches so dispatch() can deliver events.
+                windows_platform::action_handler::start_relay(app.clone());
+
                 let is_bg =
                     windows_platform::background_activation::is_background_activation_launch();
 
