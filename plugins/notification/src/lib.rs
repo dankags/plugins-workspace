@@ -314,19 +314,46 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             {
                 let config: PluginConfig = api.config().clone();
                 app.manage(config.clone());
-                // Start the event relay thread to forward COM activations to the main thread
-                windows_platform::action_handler::start_relay(app.clone());
 
-                // Load any pending activations from the previous session before starting the worker
-                // This ensures we don't miss any activations that happened while the app was not running
-                windows_platform::activation_queue::load_queue();
+                let app_name = app
+                    .config()
+                    .product_name
+                    .clone()
+                    .unwrap_or_else(|| app.config().identifier.clone());
 
-                // Start the background worker that listens for COM activations and dispatches them to the main thread
-                windows_platform::activation_queue::start_worker();
+                let guid_str = config
+                    .com_server_guid
+                    .clone()
+                    .unwrap_or_else(|| "default".into());
 
+                let storage_dir = dirs::data_local_dir()
+                    .unwrap()
+                    .join(format!("tauri-notification-{}", app.config().identifier))
+                    .join(&app_name)
+                    .join(&guid_str);
+                std::fs::create_dir_all(&storage_dir)
+                    .expect("failed to create notification storage directory");
+
+                windows_platform::runtime_context::init_context(app_name, guid_str, storage_dir);
+
+                // Detect background launch FIRST
                 let is_bg = windows_platform::com_activator::is_background_activation_launch();
 
-                // 1. Parse GUID from config
+                log::debug!(
+                    "[notification] launch mode: {}",
+                    if is_bg { "background" } else { "foreground" }
+                );
+
+                // ------------------------------------------------------------
+                // Always start relay first
+                // ------------------------------------------------------------
+
+                windows_platform::action_handler::start_relay(app.clone());
+
+                // ------------------------------------------------------------
+                // Register COM activator
+                // ------------------------------------------------------------
+
                 let guid: Option<GUID> = config
                     .com_server_guid
                     .as_deref()
@@ -334,54 +361,93 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     .transpose()
                     .map_err(|e| tauri::Error::Anyhow(anyhow::anyhow!(e)))?;
 
-                // 2. Register COM Activator using the hardened bridge
                 if let Some(ref guid) = guid {
                     match windows_platform::com_activator::run_background_activation_loop(guid) {
-                        Ok(_) => log::debug!("[notification] Hardened COM registration active"),
-                        Err(e) => log::error!("[notification] COM registration failed: {e}"),
-                    }
-                }
-
-                // 3. Foreground-only setup (Registry/Shortcuts)
-                if !is_bg {
-                    let aumid = app.config().identifier.clone();
-                    let display_name = app
-                        .config()
-                        .product_name
-                        .clone()
-                        .unwrap_or_else(|| aumid.clone());
-
-                    if let Some(ref guid_str) = config.com_server_guid {
-                        let reg_config = windows_platform::registry_installer::RegistryConfig {
-                            com_server_guid: guid_str.clone(),
-                            aumid: aumid.clone(),
-                            display_name: display_name.clone(),
-                            icon_path: None,
-                            exe_path: None,
-                        };
-                        let _ = windows_platform::registry_installer::install(&reg_config);
-
-                        let shortcut_config = windows_platform::shortcut_creator::ShortcutConfig {
-                            shortcut_name: display_name,
-                            aumid,
-                            com_server_guid: Some(guid_str.clone()),
-                            exe_path: None,
-                        };
-                        let shortcut_result =
-                            windows_platform::shortcut_creator::create_or_update(&shortcut_config);
-                        match shortcut_result {
-                            Ok(_) => {
-                                log::debug!("[notification] Shortcut created/updated successfully")
-                            }
-                            Err(e) => {
-                                log::error!("[notification] Failed to create/update shortcut: {e}")
-                            }
+                        Ok(_) => {
+                            log::debug!("[notification] Hardened COM registration active");
+                        }
+                        Err(e) => {
+                            log::error!("[notification] COM registration failed: {e}");
                         }
                     }
-
-                    #[cfg(feature = "deep-link")]
-                    windows_platform::activation_bridge::register_deep_link_handler(app);
                 }
+
+                // ------------------------------------------------------------
+                // BACKGROUND PROCESS PATH
+                // ------------------------------------------------------------
+
+                if is_bg {
+                    log::debug!("[notification] background activation process started");
+
+                    // Restore queue
+                    windows_platform::activation_queue::load_queue();
+
+                    // Start worker to process queued activation
+                    windows_platform::activation_queue::start_worker();
+
+                    // Give worker time to dispatch activation
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+
+                        log::debug!("[notification] background process exiting");
+
+                        std::process::exit(0);
+                    });
+
+                    return Ok(());
+                }
+
+                // ------------------------------------------------------------
+                // FOREGROUND PROCESS PATH
+                // ------------------------------------------------------------
+
+                log::debug!("[notification] foreground initialization");
+
+                windows_platform::activation_queue::load_queue();
+
+                windows_platform::activation_queue::start_worker();
+
+                let aumid = app.config().identifier.clone();
+
+                let display_name = app
+                    .config()
+                    .product_name
+                    .clone()
+                    .unwrap_or_else(|| aumid.clone());
+
+                if let Some(ref guid_str) = config.com_server_guid {
+                    let reg_config = windows_platform::registry_installer::RegistryConfig {
+                        com_server_guid: guid_str.clone(),
+                        aumid: aumid.clone(),
+                        display_name: display_name.clone(),
+                        icon_path: None,
+                        exe_path: None,
+                    };
+
+                    let _ = windows_platform::registry_installer::install(&reg_config);
+
+                    let shortcut_config = windows_platform::shortcut_creator::ShortcutConfig {
+                        shortcut_name: display_name,
+                        aumid,
+                        com_server_guid: Some(guid_str.clone()),
+                        exe_path: None,
+                    };
+
+                    let shortcut_result =
+                        windows_platform::shortcut_creator::create_or_update(&shortcut_config);
+
+                    match shortcut_result {
+                        Ok(_) => {
+                            log::debug!("[notification] Shortcut created/updated")
+                        }
+                        Err(e) => {
+                            log::error!("[notification] Shortcut failed: {e}")
+                        }
+                    }
+                }
+
+                #[cfg(feature = "deep-link")]
+                windows_platform::activation_bridge::register_deep_link_handler(app);
             }
 
             #[cfg(mobile)]

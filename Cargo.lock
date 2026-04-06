@@ -7177,6 +7177,7 @@ dependencies = [
  "anyhow",
  "color-backtrace",
  "ctor",
+ "dirs 6.0.0",
  "log",
  "maplit",
  "notify-rust",

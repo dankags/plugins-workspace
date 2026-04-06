@@ -27,6 +27,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::windows_platform::runtime_context::context;
 use crate::NotificationActionEvent;
 
 use crate::trace_event;
@@ -69,13 +70,12 @@ pub struct QueuedActivation {
 // ============================================================
 
 fn queue_file() -> PathBuf {
-    std::env::temp_dir().join("tauri_activation_queue.json")
+    context().storage_dir.join("activation_queue.json")
 }
 
 fn journal_file() -> PathBuf {
-    std::env::temp_dir().join("tauri_activation_queue.journal")
+    context().storage_dir.join("activation_queue.journal")
 }
-
 // ============================================================
 // Persistence
 // ============================================================

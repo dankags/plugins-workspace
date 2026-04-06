@@ -18,7 +18,7 @@
 use std::sync::{mpsc, OnceLock};
 use tauri::{AppHandle, Emitter, Runtime};
 
-use crate::models::NotificationActionEvent;
+use crate::{models::NotificationActionEvent, trace_event};
 
 /// The Tauri event name emitted when a notification action fires.
 pub const EVENT_NAME: &str = "notification://action";
@@ -57,6 +57,8 @@ pub fn dispatch(event: NotificationActionEvent) {
 /// Must be called once from `plugin::init()` **after** the `AppHandle` is
 /// available.  Safe to call multiple times — subsequent calls are no-ops.
 pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
+    trace_event!("notification::start_relay initializing");
+
     // Channel capacity: 64 queued events before `try_send` starts failing.
     // This is plenty for realistic notification interaction rates.
     let (tx, rx) = mpsc::sync_channel::<NotificationActionEvent>(64);
@@ -69,6 +71,7 @@ pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
     std::thread::Builder::new()
         .name("notification-action-relay".to_string())
         .spawn(move || {
+            trace_event!("notification::start_relay relay thread started");
             log::debug!("[notification] action relay thread started");
             for event in rx {
                 log::debug!(

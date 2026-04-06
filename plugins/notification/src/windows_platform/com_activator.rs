@@ -38,6 +38,8 @@ use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows_core::*;
 use windows_sys::Win32::Foundation::RPC_E_TOO_LATE;
 
+use crate::windows_platform::runtime_context::context;
+
 thread_local! {
     static COM_INITIALIZED: Cell<bool> = const { Cell::new(false) };
 }
@@ -126,7 +128,7 @@ impl IClassFactory_Impl for NotificationActivatorFactory_Impl {
 // ============================================================
 
 fn journal_path() -> PathBuf {
-    std::env::temp_dir().join("tauri_com_activation.log")
+    context().storage_dir.join("tauri_com_activation.log")
 }
 
 pub fn write_journal(event: &str) {
