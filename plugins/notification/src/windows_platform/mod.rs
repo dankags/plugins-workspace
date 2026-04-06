@@ -24,6 +24,7 @@ pub mod notification_listener;
 pub mod registry_installer;
 pub mod runtime_context;
 pub mod shortcut_creator;
+pub mod shutdown;
 pub mod version;
 pub mod xml_builder;
 

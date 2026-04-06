@@ -128,9 +128,9 @@ impl IClassFactory_Impl for NotificationActivatorFactory_Impl {
 // ============================================================
 
 fn journal_path() -> PathBuf {
-    context().storage_dir.join("tauri_com_activation.log")
+    std::panic::catch_unwind(|| context().storage_dir.join("tauri_com_activation.log"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("tauri_com_activation.log"))
 }
-
 pub fn write_journal(event: &str) {
     if let Ok(mut file) = OpenOptions::new()
         .create(true)

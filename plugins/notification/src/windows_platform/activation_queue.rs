@@ -27,7 +27,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::windows_platform::runtime_context::context;
+use crate::windows_platform::{runtime_context::context, shutdown};
 use crate::NotificationActionEvent;
 
 use crate::trace_event;
@@ -70,7 +70,9 @@ pub struct QueuedActivation {
 // ============================================================
 
 fn queue_file() -> PathBuf {
-    context().storage_dir.join("activation_queue.json")
+    let dir = context().storage_dir.clone();
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("activation_queue.json")
 }
 
 fn journal_file() -> PathBuf {
@@ -212,6 +214,7 @@ pub fn start_worker() {
         }
 
         WORKER_RUNNING.store(false, Ordering::SeqCst);
+        shutdown::signal_worker_complete();
     });
 }
 
@@ -285,6 +288,16 @@ fn cleanup_after_success(id: String) {
     save_queue(&queue);
 }
 
+pub fn flush() -> crate::Result<()> {
+    trace_event!("Flushing activation queue");
+
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    queue.clear();
+    save_queue(&queue);
+
+    Ok(())
+}
+
 // ============================================================
 // Utilities
 // ============================================================
@@ -303,6 +316,8 @@ fn now() -> u64 {
 #[cfg(test)]
 
 mod tests {
+    use crate::windows_platform::{self, runtime_context};
+
     use super::*;
     use std::collections::HashMap;
     use std::fs;
@@ -325,6 +340,12 @@ mod tests {
         std::env::remove_var("DISABLE_WORKER");
 
         SHUTDOWN.store(true, Ordering::SeqCst);
+        runtime_context::init_context(
+            "TestApp".into(),
+            "00000000-0000-0000-0000-000000000000".into(),
+            std::env::temp_dir().join("notification_test_storage"),
+        );
+        windows_platform::shutdown::init();
 
         thread::sleep(Duration::from_millis(50));
 

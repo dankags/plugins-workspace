@@ -327,13 +327,19 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     .unwrap_or_else(|| "default".into());
 
                 let storage_dir = dirs::data_local_dir()
-                    .unwrap()
+                    .ok_or_else(|| {
+                        tauri::Error::Anyhow(anyhow::anyhow!(
+                            "failed to locate local data directory"
+                        ))
+                    })?
                     .join(format!("tauri-notification-{}", app.config().identifier))
                     .join(&app_name)
                     .join(&guid_str);
-                std::fs::create_dir_all(&storage_dir)
-                    .expect("failed to create notification storage directory");
-
+                std::fs::create_dir_all(&storage_dir).map_err(|e| {
+                    tauri::Error::Anyhow(anyhow::anyhow!(
+                        "failed to create notification storage directory: {e}"
+                    ))
+                })?;
                 windows_platform::runtime_context::init_context(app_name, guid_str, storage_dir);
 
                 // Detect background launch FIRST
@@ -385,14 +391,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     // Start worker to process queued activation
                     windows_platform::activation_queue::start_worker();
 
-                    // Give worker time to dispatch activation
-                    std::thread::spawn(|| {
-                        std::thread::sleep(std::time::Duration::from_secs(3));
-
-                        log::debug!("[notification] background process exiting");
-
-                        std::process::exit(0);
-                    });
+                    windows_platform::shutdown::spawn_background_exit_watcher(15);
 
                     return Ok(());
                 }
@@ -424,7 +423,9 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                         exe_path: None,
                     };
 
-                    let _ = windows_platform::registry_installer::install(&reg_config);
+                    if let Err(e) = windows_platform::registry_installer::install(&reg_config) {
+                        log::error!("[notification] Registry installation failed: {e}");
+                    }
 
                     let shortcut_config = windows_platform::shortcut_creator::ShortcutConfig {
                         shortcut_name: display_name,
