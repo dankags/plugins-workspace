@@ -19,7 +19,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,18 @@ use windows_core::*;
 use windows_sys::Win32::Foundation::RPC_E_TOO_LATE;
 
 use crate::windows_platform::runtime_context::context;
+
+static GLOBAL_REGISTRATION: OnceLock<Mutex<Option<ComRegistration>>> = OnceLock::new();
+
+fn registration_slot() -> &'static Mutex<Option<ComRegistration>> {
+    GLOBAL_REGISTRATION.get_or_init(|| Mutex::new(None))
+}
+
+static GLOBAL_CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+fn cancel_token() -> &'static Arc<AtomicBool> {
+    GLOBAL_CANCEL.get_or_init(|| Arc::new(AtomicBool::new(false)))
+}
 
 thread_local! {
     static COM_INITIALIZED: Cell<bool> = const { Cell::new(false) };
@@ -521,21 +533,47 @@ pub fn run_background_activation(clsid: &GUID, factory: &IUnknown) -> windows::c
 
     trace_event!("Background activation detected");
 
+    // ------------------------------------------------------------
+    // Prevent multi-instance collision
+    // ------------------------------------------------------------
+
     let _instance = InstanceGuard::acquire("Global\\Tauri.Notification.COM")?;
+
+    // ------------------------------------------------------------
+    // Start watchdog
+    // ------------------------------------------------------------
 
     let watchdog = ActivationWatchdog::start(5000);
 
+    // ------------------------------------------------------------
+    // Register COM
+    // ------------------------------------------------------------
+
     let registration = register_with_retry(clsid, factory, 3)?;
 
-    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut slot = registration_slot().lock().unwrap();
+
+        *slot = Some(registration);
+    }
+
+    trace_event!("COM registration stored in global slot");
+
+    // ------------------------------------------------------------
+    // Run message pump
+    // ------------------------------------------------------------
+
+    let cancel = cancel_token().clone();
 
     run_pump_with_cancel(5000, cancel.clone());
+
+    // ------------------------------------------------------------
+    // Cleanup coordination
+    // ------------------------------------------------------------
 
     cancel.store(true, Ordering::SeqCst);
 
     watchdog.cancel();
-
-    drop(registration);
 
     trace_event!("Activation completed");
 
@@ -549,4 +587,63 @@ pub fn run_background_activation_loop(clsid: &GUID) -> windows::core::Result<()>
 
     // 2. Pass it to your existing hardened runner
     run_background_activation(clsid, &factory)
+}
+
+pub fn plugin_unregister() -> windows::core::Result<()> {
+    trace_event!("Plugin unregister initiated");
+
+    // ------------------------------------------------------------
+    // 1. Stop message pump
+    // ------------------------------------------------------------
+
+    if let Some(cancel) = GLOBAL_CANCEL.get() {
+        cancel.store(true, Ordering::SeqCst);
+
+        trace_event!("Message pump cancellation requested");
+    }
+
+    // ------------------------------------------------------------
+    // 2. Flush activation queue safely
+    // ------------------------------------------------------------
+
+    if let Err(e) = crate::windows_platform::activation_queue::flush() {
+        trace_event!("Queue flush failed during shutdown");
+        log::error!("[notification] queue flush error: {}", e);
+    } else {
+        trace_event!("Queue flushed successfully");
+    }
+
+    // ------------------------------------------------------------
+    // 3. Stop worker thread
+    // ------------------------------------------------------------
+
+    crate::windows_platform::activation_queue::shutdown_worker();
+
+    trace_event!("Worker shutdown requested");
+
+    // ------------------------------------------------------------
+    // 4. Revoke COM class registration
+    // ------------------------------------------------------------
+
+    {
+        let mut slot = registration_slot().lock().unwrap();
+
+        if let Some(registration) = slot.take() {
+            drop(registration);
+
+            trace_event!("COM registration dropped");
+        } else {
+            trace_event!("No active COM registration");
+        }
+    }
+
+    // ------------------------------------------------------------
+    // 5. Final state reset
+    // ------------------------------------------------------------
+
+    CLASS_REGISTERED.store(false, Ordering::SeqCst);
+
+    trace_event!("Plugin unregister completed");
+
+    Ok(())
 }

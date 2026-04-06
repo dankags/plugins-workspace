@@ -75,9 +75,9 @@ fn graceful_shutdown() {
 
     log::debug!("[notification] unregistering COM server");
 
-    // if let Err(e) = crate::windows_platform::com_activator::plugin_unregister() {
-    //     log::error!("[notification] COM unregister failed: {}", e);
-    // }
+    if let Err(e) = crate::windows_platform::com_activator::plugin_unregister() {
+        log::error!("[notification] COM unregister failed: {}", e);
+    }
 
     log::debug!("[notification] background shutdown complete");
 

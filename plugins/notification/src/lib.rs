@@ -463,7 +463,11 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 #[cfg(windows)]
                 {
                     // Clean up the COM registration safely
-                    // crate::windows_platform::com_activator::plugin_unregister();
+                    if let Err(e) = crate::windows_platform::com_activator::plugin_unregister() {
+                        log::error!("[notification] COM unregistration failed: {e}");
+                    }
+
+                    // Ensure worker thread is stopped before allowing process to exit
                     windows_platform::activation_queue::shutdown_worker();
                 }
             }

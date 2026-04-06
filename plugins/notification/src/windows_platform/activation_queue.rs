@@ -295,6 +295,9 @@ pub fn flush() -> crate::Result<()> {
     queue.clear();
     save_queue(&queue);
 
+    let mut dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+    dedup.clear();
+
     Ok(())
 }
 
