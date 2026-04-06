@@ -33,19 +33,20 @@ static SENDER: OnceLock<mpsc::SyncSender<NotificationActionEvent>> = OnceLock::n
 /// If the relay thread has not been started yet (e.g. during early startup),
 /// the event is silently dropped and a warning is logged.
 pub fn dispatch(event: NotificationActionEvent) {
-    println!(
+    log::debug!(
         "[notification] dispatch called: action_id={}",
         event.action_id
     );
+
     match SENDER.get() {
         Some(tx) => {
-            println!("[notification] sending to relay channel");
+            log::debug!("[notification] sending to relay channel");
             if tx.try_send(event).is_err() {
-                println!("[notification] ❌ relay channel full");
+                log::warn!("[notification] ❌ relay channel full");
             }
         }
         None => {
-            println!("[notification] ❌ SENDER is None — relay never started!");
+            log::warn!("[notification] ❌ SENDER is None — relay never started!");
         }
     }
 }

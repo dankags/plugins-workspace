@@ -314,13 +314,15 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             {
                 let config: PluginConfig = api.config().clone();
                 app.manage(config.clone());
+                // Start the event relay thread to forward COM activations to the main thread
+                windows_platform::action_handler::start_relay(app.clone());
 
+                // Load any pending activations from the previous session before starting the worker
+                // This ensures we don't miss any activations that happened while the app was not running
                 windows_platform::activation_queue::load_queue();
 
+                // Start the background worker that listens for COM activations and dispatches them to the main thread
                 windows_platform::activation_queue::start_worker();
-
-                // Start the event relay thread
-                windows_platform::action_handler::start_relay(app.clone());
 
                 let is_bg = windows_platform::com_activator::is_background_activation_launch();
 
