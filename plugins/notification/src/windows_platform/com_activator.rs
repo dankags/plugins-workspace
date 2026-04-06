@@ -564,6 +564,7 @@ pub fn run_background_activation(clsid: &GUID, factory: &IUnknown) -> windows::c
     // ------------------------------------------------------------
 
     let cancel = cancel_token().clone();
+    cancel.store(false, Ordering::SeqCst);
 
     run_pump_with_cancel(5000, cancel.clone());
 
