@@ -34,6 +34,9 @@ url = { version = "2", features = ["serde"] }
 serde_repr = "0.1"
 anyhow = "1.0.102"
 tauri-plugin-deep-link = { version = "2.4.7", path = "../deep-link", optional = true }
+uuid = {version ="1.20.0", features = [
+    "v4",
+]}
 
 [target.'cfg(target_os = "ios")'.dependencies]
 tauri = { workspace = true, features = ["wry"] }
@@ -81,7 +84,8 @@ features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Variant",
     "Win32_System_Com_StructuredStorage",
-
+    "Win32_System_Threading",
+    "Win32_System_Services",
 
     ]
 

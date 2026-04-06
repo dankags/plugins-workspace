@@ -313,25 +313,18 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             #[cfg(windows)]
             {
                 let config: PluginConfig = api.config().clone();
-
-                // Store config as managed state so uninstall commands can read it.
                 app.manage(config.clone());
 
-                // Start the relay thread immediately — needed on both foreground
-                // and background launches so dispatch() can deliver events.
+                windows_platform::activation_queue::load_queue();
+
+                windows_platform::activation_queue::start_worker();
+
+                // Start the event relay thread
                 windows_platform::action_handler::start_relay(app.clone());
 
-                let is_bg =
-                    windows_platform::background_activation::is_background_activation_launch();
+                let is_bg = windows_platform::com_activator::is_background_activation_launch();
 
-                // ── COM activator registration ────────────────────────────
-                if !is_bg {
-                    log::debug!(
-                        "[notification] comServerGuid = {:?}",
-                        config.com_server_guid
-                    );
-                }
-
+                // 1. Parse GUID from config
                 let guid: Option<GUID> = config
                     .com_server_guid
                     .as_deref()
@@ -339,26 +332,15 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     .transpose()
                     .map_err(|e| tauri::Error::Anyhow(anyhow::anyhow!(e)))?;
 
+                // 2. Register COM Activator using the hardened bridge
                 if let Some(ref guid) = guid {
-                    match crate::windows_platform::com_activator::register(guid) {
-                        Ok(()) => log::debug!(
-                            "[notification] ✅ COM activator registered: {}",
-                            config.com_server_guid.as_deref().unwrap_or("none")
-                        ),
-                        Err(e) => {
-                            log::error!("[notification] ❌ COM activator registration failed: {e}")
-                        }
+                    match windows_platform::com_activator::run_background_activation_loop(guid) {
+                        Ok(_) => log::debug!("[notification] Hardened COM registration active"),
+                        Err(e) => log::error!("[notification] COM registration failed: {e}"),
                     }
-                } else {
-                    log::warn!(
-                        "[notification] ❌ No comServerGuid in config — actions will not fire"
-                    );
                 }
 
-                // ── Registry + shortcut (foreground launch only) ──────────
-                // Skip during background activation — we only need the COM
-                // server alive; writing registry/shortcut is not needed and
-                // would slow down the tight callback window.
+                // 3. Foreground-only setup (Registry/Shortcuts)
                 if !is_bg {
                     let aumid = app.config().identifier.clone();
                     let display_name = app
@@ -373,12 +355,9 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                             aumid: aumid.clone(),
                             display_name: display_name.clone(),
                             icon_path: None,
-                            exe_path: None, // defaults to current_exe()
+                            exe_path: None,
                         };
-
-                        if let Err(e) = windows_platform::registry_installer::install(&reg_config) {
-                            log::warn!("[notification] registry install failed: {e}");
-                        }
+                        let _ = windows_platform::registry_installer::install(&reg_config);
 
                         let shortcut_config = windows_platform::shortcut_creator::ShortcutConfig {
                             shortcut_name: display_name,
@@ -386,15 +365,18 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                             com_server_guid: Some(guid_str.clone()),
                             exe_path: None,
                         };
-
-                        if let Err(e) =
-                            windows_platform::shortcut_creator::create_or_update(&shortcut_config)
-                        {
-                            log::warn!("[notification] shortcut create failed: {e}");
+                        let shortcut_result =
+                            windows_platform::shortcut_creator::create_or_update(&shortcut_config);
+                        match shortcut_result {
+                            Ok(_) => {
+                                log::debug!("[notification] Shortcut created/updated successfully")
+                            }
+                            Err(e) => {
+                                log::error!("[notification] Failed to create/update shortcut: {e}")
+                            }
                         }
                     }
 
-                    // ── Deep-link handler (foreground activations) ────────
                     #[cfg(feature = "deep-link")]
                     windows_platform::activation_bridge::register_deep_link_handler(app);
                 }
@@ -408,11 +390,13 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             Ok(())
         })
         .on_event(|_app, event| {
-            // Unregister the COM activator when the app exits to release
-            // the class object registration cleanly.
             if let tauri::RunEvent::Exit = event {
                 #[cfg(windows)]
-                crate::windows_platform::com_activator::unregister();
+                {
+                    // Clean up the COM registration safely
+                    // crate::windows_platform::com_activator::plugin_unregister();
+                    windows_platform::activation_queue::shutdown_worker();
+                }
             }
         })
         .build()

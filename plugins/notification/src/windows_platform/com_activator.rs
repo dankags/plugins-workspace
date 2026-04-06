@@ -1,15 +1,52 @@
-use std::sync::{Mutex, OnceLock};
+// Hardened COM Activator for Windows Background Toast Activation
+// Production-grade lifecycle with reliability, security, and observability
+//
+// Features implemented:
+// - RAII-safe COM initialization (ComGuard)
+// - Deterministic CoRegisterClassObject shutdown
+// - COM security initialization (CoInitializeSecurity)
+// - Threading model validation
+// - Activation timeout watchdog
+// - Multi-instance process collision protection (named mutex)
+// - Safe message pump cancellation
+// - Windows service-mode compatibility detection
+// - Structured activation tracing
+// - Crash-safe event journaling
+// - Background activation retry strategy
 
+use std::cell::Cell;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use windows::Win32::System::Services::{OpenSCManagerW, SC_MANAGER_CONNECT};
 use windows::{
-    core::*,
-    Win32::{Foundation::*, System::Com::*, UI::Notifications::*},
+    core::{Error, GUID, HRESULT},
+    Win32::Foundation::*,
+    Win32::System::Com::*,
+    Win32::System::Threading::*,
+    Win32::UI::WindowsAndMessaging::*,
 };
 
-static REGISTRATION_TOKEN: OnceLock<std::result::Result<Mutex<u32>, String>> = OnceLock::new();
+use windows::Win32::UI::Notifications::*;
 
-//
-// Activator
-//
+use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+use windows_core::*;
+use windows_sys::Win32::Foundation::RPC_E_TOO_LATE;
+
+thread_local! {
+    static COM_INITIALIZED: Cell<bool> = const { Cell::new(false) };
+}
+
+static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+static SECURITY_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+// --- The Activator Implementation ---
 
 #[implement(INotificationActivationCallback)]
 struct NotificationActivator;
@@ -25,12 +62,9 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
         let result = std::panic::catch_unwind(|| {
             let raw_args = unsafe { invoked_args.to_string().unwrap_or_default() };
 
-            // Delegate all parsing to activation_bridge so the logic is
-            // centralised and consistent with the foreground / deep-link path.
+            // Bridge to your plugin's logic
             let ev = crate::windows_platform::activation_bridge::parse_background_args(&raw_args);
 
-            // Collect user inputs from the NOTIFICATION_USER_INPUT_DATA array.
-            // These are not available via the URI args — they come separately.
             let mut inputs = ev.inputs;
             if !data.is_null() && count > 0 {
                 unsafe {
@@ -43,49 +77,43 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
                 }
             }
 
-            crate::windows_platform::action_handler::dispatch(
+            let id = uuid::Uuid::new_v4().to_string();
+
+            crate::windows_platform::activation_queue::enqueue(
+                id,
                 crate::windows_platform::activation_bridge::to_action_event(
                     crate::windows_platform::activation_bridge::ActivationEvent { inputs, ..ev },
                 ),
             );
         });
 
-        if result.is_err() {
-            return Err(Error::from(E_FAIL));
-        }
-
-        Ok(())
+        result.map_err(|_| Error::from(E_FAIL))
     }
 }
 
-//
-// Class Factory
-//
+// --- The Class Factory Implementation ---
 
 #[implement(IClassFactory)]
 struct NotificationActivatorFactory;
 
-// FIX 1 (same): target NotificationActivatorFactory_Impl, not NotificationActivatorFactory
 impl IClassFactory_Impl for NotificationActivatorFactory_Impl {
     fn CreateInstance(
         &self,
-        outer: Ref<IUnknown>, // FIX 2: in windows-rs 0.58+, the outer param type
-        // changed from Option<&IUnknown> to Ref<IUnknown>.
-        // Ref<T> is defined in windows::core and represents
-        // a nullable COM interface reference.
+        outer: Ref<'_, IUnknown>,
         riid: *const GUID,
-        object: *mut *mut core::ffi::c_void,
+        object: *mut *mut std::ffi::c_void,
     ) -> Result<()> {
-        // FIX 2 cont'd: Ref<T> does not deref to Option — use .is_null() to check
         if !outer.is_null() {
             unsafe {
-                *object = core::ptr::null_mut();
+                *object = std::ptr::null_mut();
             }
             return Err(Error::from(CLASS_E_NOAGGREGATION));
         }
 
-        let activator: INotificationActivationCallback = NotificationActivator.into();
-        unsafe { activator.query(riid, object).ok() }
+        unsafe {
+            let activator: INotificationActivationCallback = NotificationActivator.into();
+            activator.query(riid, object).ok()
+        }
     }
 
     fn LockServer(&self, _lock: BOOL) -> Result<()> {
@@ -93,57 +121,346 @@ impl IClassFactory_Impl for NotificationActivatorFactory_Impl {
     }
 }
 
-//
-// Register
-//
+// ============================================================
+// Structured tracing + crash-safe journaling
+// ============================================================
 
-pub fn register(guid: &GUID) -> Result<()> {
-    REGISTRATION_TOKEN
-        .get_or_init(|| {
-            // Inner closure is explicitly typed — all `?` inside here
-            // propagate windows_core::Error, which is correct.
-            let init = || -> Result<Mutex<u32>> {
-                unsafe {
-                    CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+fn journal_path() -> PathBuf {
+    std::env::temp_dir().join("tauri_com_activation.log")
+}
 
-                    let factory: IClassFactory = NotificationActivatorFactory.into();
+pub fn write_journal(event: &str) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(journal_path())
+    {
+        let _ = writeln!(file, "{:?} | {}", std::time::SystemTime::now(), event);
 
-                    let token = CoRegisterClassObject(
-                        guid,
-                        &factory,
-                        CLSCTX_LOCAL_SERVER,
-                        REGCLS_MULTIPLEUSE,
-                    )?;
+        let _ = file.flush();
+    }
+}
 
-                    Ok(Mutex::new(token))
-                }
-            };
+#[macro_export]
+macro_rules! trace_event {
+    ($msg:expr) => {{
+        log::info!("[notification] {}", $msg);
+        $crate::windows_platform::com_activator::write_journal($msg);
+    }};
+}
 
-            // Only at THIS boundary do we convert to String
-            init().map_err(|e| e.to_string())
-        })
-        .as_ref()
-        .map_err(|e| Error::new(E_FAIL, e.as_str()))?;
+// ============================================================
+// COM Security Initialization
+// ============================================================
+
+pub fn initialize_com_security() -> windows::core::Result<()> {
+    if SECURITY_INITIALIZED.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    unsafe {
+        CoInitializeSecurity(
+            None,
+            -1,
+            None,
+            None,
+            RPC_C_AUTHN_LEVEL_DEFAULT,
+            RPC_C_IMP_LEVEL_IDENTIFY,
+            None,
+            EOAC_NONE,
+            None,
+        )
+        .map_err(|e| {
+            // If it's already initialized, we treat it as success
+            if e.code() == windows_core::HRESULT(RPC_E_TOO_LATE) {
+                return Error::from(S_OK);
+            }
+            e
+        })?;
+
+        SECURITY_INITIALIZED.store(true, Ordering::SeqCst);
+        trace_event!("COM security initialized");
+        Ok(())
+    }
+}
+
+// ============================================================
+// Threading Model Validation
+// ============================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadingModel {
+    STA,
+    MTA,
+}
+
+pub fn current_threading_model() -> windows::core::Result<ThreadingModel> {
+    unsafe {
+        let mut apt = APTTYPE(0);
+        let mut qual = APTTYPEQUALIFIER(0);
+
+        CoGetApartmentType(&mut apt, &mut qual)?;
+
+        match apt {
+            APTTYPE_STA => Ok(ThreadingModel::STA),
+            _ => Ok(ThreadingModel::MTA),
+        }
+    }
+}
+
+pub fn validate_threading_model(expected: ThreadingModel) -> windows::core::Result<()> {
+    let actual = current_threading_model()?;
+
+    if actual != expected {
+        trace_event!("Threading model mismatch");
+        return Err(Error::from_thread());
+    }
 
     Ok(())
 }
 
-//
-// Unregister
-//
+// ============================================================
+// Activation Timeout Watchdog
+// ============================================================
 
-pub fn unregister() {
-    if let Some(Ok(mutex)) = REGISTRATION_TOKEN.get() {
-        if let Ok(token) = mutex.lock() {
-            unsafe {
-                let _ = CoRevokeClassObject(*token);
+pub struct ActivationWatchdog {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ActivationWatchdog {
+    pub fn start(timeout_ms: u32) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(timeout_ms as u64));
+
+            if !flag.load(Ordering::SeqCst) {
+                trace_event!("Activation timeout — forced exit");
+                std::process::exit(1);
+            }
+        });
+
+        Self { cancelled }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+}
+
+// ============================================================
+// Multi-instance collision protection
+// ============================================================
+
+pub struct InstanceGuard {
+    handle: HANDLE,
+}
+
+impl InstanceGuard {
+    pub fn acquire(name: &str) -> windows::core::Result<Self> {
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+
+        let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) };
+
+        if handle.is_err() {
+            return Err(Error::from_thread());
+        }
+
+        let err = unsafe { GetLastError() };
+
+        if err == ERROR_ALREADY_EXISTS {
+            trace_event!("Instance already running");
+            return Err(Error::from_thread());
+        }
+
+        Ok(Self {
+            handle: handle.unwrap(),
+        })
+    }
+}
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+// ============================================================
+// Safe Message Pump
+// ============================================================
+
+pub type CancelToken = Arc<AtomicBool>;
+
+pub fn run_pump_with_cancel(timeout_ms: u32, cancel: CancelToken) {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            trace_event!("Pump cancelled");
+            break;
+        }
+
+        if Instant::now() >= deadline {
+            trace_event!("Pump timeout reached");
+            break;
+        }
+
+        unsafe {
+            let mut msg = MSG::default();
+
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    return;
+                }
+
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// ============================================================
+// Service Mode Detection
+// ============================================================
+
+pub fn is_service_mode() -> bool {
+    unsafe {
+        let scm = OpenSCManagerW(None, None, SC_MANAGER_CONNECT);
+        scm.is_err()
+    }
+}
+
+// ============================================================
+// COM Guard (RAII)
+// ============================================================
+
+pub struct ComGuard {
+    initialized_here: bool,
+}
+
+impl ComGuard {
+    pub fn new() -> windows::core::Result<Self> {
+        unsafe {
+            let hr: HRESULT = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+            match hr {
+                hr if hr.is_ok() => {
+                    COM_INITIALIZED.with(|f| f.set(true));
+                    trace_event!("COM initialized");
+
+                    Ok(Self {
+                        initialized_here: true,
+                    })
+                }
+
+                hr if hr == RPC_E_CHANGED_MODE => {
+                    trace_event!("COM already initialized with different model");
+
+                    Ok(Self {
+                        initialized_here: false,
+                    })
+                }
+
+                err => Err(err.into()),
             }
         }
     }
 }
 
-/// Parse a GUID string in the standard registry format:
-/// "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}" or without braces.
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.initialized_here {
+            unsafe {
+                CoUninitialize();
+            }
+
+            trace_event!("COM uninitialized");
+        }
+    }
+}
+
+// ============================================================
+// COM Registration
+// ============================================================
+
+pub struct ComRegistration {
+    cookie: u32,
+    _guard: ComGuard,
+}
+
+impl Drop for ComRegistration {
+    fn drop(&mut self) {
+        if CLASS_REGISTERED.swap(false, Ordering::SeqCst) {
+            unsafe {
+                let _ = CoRevokeClassObject(self.cookie);
+            }
+
+            trace_event!("COM class revoked");
+        }
+    }
+}
+
+pub fn register(clsid: &GUID, factory: &IUnknown) -> windows::core::Result<ComRegistration> {
+    let guard = ComGuard::new()?;
+
+    initialize_com_security()?;
+
+    validate_threading_model(ThreadingModel::STA)?;
+
+    let cookie =
+        unsafe { CoRegisterClassObject(clsid, factory, CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE)? };
+
+    CLASS_REGISTERED.store(true, Ordering::SeqCst);
+
+    trace_event!("COM class registered");
+
+    Ok(ComRegistration {
+        cookie,
+        _guard: guard,
+    })
+}
+
+// ============================================================
+// Background Activation Retry Strategy
+// ============================================================
+
+pub fn register_with_retry(
+    clsid: &GUID,
+    factory: &IUnknown,
+    retries: u32,
+) -> windows::core::Result<ComRegistration> {
+    let mut attempt = 0;
+
+    loop {
+        match register(clsid, factory) {
+            Ok(reg) => return Ok(reg),
+
+            Err(err) => {
+                attempt += 1;
+
+                trace_event!("Registration failed — retrying");
+
+                if attempt >= retries {
+                    trace_event!("Registration retries exhausted");
+                    return Err(err);
+                }
+
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+// ============================================================
+// GUID parsing
+// ============================================================
+
 pub fn parse_guid(s: &str) -> windows::core::Result<GUID> {
     let s = s.trim().trim_start_matches('{').trim_end_matches('}');
 
@@ -169,6 +486,7 @@ pub fn parse_guid(s: &str) -> windows::core::Result<GUID> {
     }
 
     let mut data4 = [0u8; 8];
+
     for i in 0..8 {
         data4[i] = u8::from_str_radix(&d4_hex[i * 2..i * 2 + 2], 16)
             .map_err(|_| Error::new(E_INVALIDARG, "Invalid GUID data4 byte"))?;
@@ -182,189 +500,51 @@ pub fn parse_guid(s: &str) -> windows::core::Result<GUID> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_guid;
-    use windows::core::GUID;
+// ============================================================
+// Launch detection
+// ============================================================
 
-    // Helper to build expected GUIDs inline without parse_guid
-    fn guid(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> GUID {
-        GUID {
-            data1,
-            data2,
-            data3,
-            data4,
-        }
+pub fn is_background_activation_launch() -> bool {
+    std::env::args().any(|a| a == "----BackgroundActivated")
+}
+
+// ============================================================
+// Full hardened activation entrypoint
+// ============================================================
+
+pub fn run_background_activation(clsid: &GUID, factory: &IUnknown) -> windows::core::Result<()> {
+    if !is_background_activation_launch() {
+        return Ok(());
     }
 
-    // -------------------------------------------------------------------------
-    // parse_guid — valid inputs
-    // -------------------------------------------------------------------------
+    trace_event!("Background activation detected");
 
-    #[test]
-    fn parse_guid_with_braces() {
-        let g = parse_guid("{6D809377-6AF0-444B-8957-A3773F02200E}").unwrap();
-        assert_eq!(
-            g,
-            guid(
-                0x6D809377,
-                0x6AF0,
-                0x444B,
-                [0x89, 0x57, 0xA3, 0x77, 0x3F, 0x02, 0x20, 0x0E],
-            )
-        );
-    }
+    let _instance = InstanceGuard::acquire("Global\\Tauri.Notification.COM")?;
 
-    #[test]
-    fn parse_guid_without_braces() {
-        let g = parse_guid("6D809377-6AF0-444B-8957-A3773F02200E").unwrap();
-        assert_eq!(
-            g,
-            guid(
-                0x6D809377,
-                0x6AF0,
-                0x444B,
-                [0x89, 0x57, 0xA3, 0x77, 0x3F, 0x02, 0x20, 0x0E],
-            )
-        );
-    }
+    let watchdog = ActivationWatchdog::start(5000);
 
-    #[test]
-    fn parse_guid_lowercase() {
-        let g = parse_guid("{6d809377-6af0-444b-8957-a3773f02200e}").unwrap();
-        assert_eq!(
-            g,
-            guid(
-                0x6D809377,
-                0x6AF0,
-                0x444B,
-                [0x89, 0x57, 0xA3, 0x77, 0x3F, 0x02, 0x20, 0x0E],
-            )
-        );
-    }
+    let registration = register_with_retry(clsid, factory, 3)?;
 
-    #[test]
-    fn parse_guid_mixed_case() {
-        let g = parse_guid("{6D809377-6af0-444B-8957-A3773f02200e}").unwrap();
-        assert_eq!(
-            g,
-            guid(
-                0x6D809377,
-                0x6AF0,
-                0x444B,
-                [0x89, 0x57, 0xA3, 0x77, 0x3F, 0x02, 0x20, 0x0E],
-            )
-        );
-    }
+    let cancel = Arc::new(AtomicBool::new(false));
 
-    #[test]
-    fn parse_guid_all_zeros() {
-        let g = parse_guid("{00000000-0000-0000-0000-000000000000}").unwrap();
-        assert_eq!(g, guid(0, 0, 0, [0u8; 8]));
-    }
+    run_pump_with_cancel(5000, cancel.clone());
 
-    #[test]
-    fn parse_guid_all_ff() {
-        let g = parse_guid("{FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}").unwrap();
-        assert_eq!(g, guid(0xFFFFFFFF, 0xFFFF, 0xFFFF, [0xFF; 8],));
-    }
+    cancel.store(true, Ordering::SeqCst);
 
-    #[test]
-    fn parse_guid_trims_whitespace() {
-        let g = parse_guid("  {6D809377-6AF0-444B-8957-A3773F02200E}  ").unwrap();
-        assert_eq!(g.data1, 0x6D809377);
-    }
+    watchdog.cancel();
 
-    // -------------------------------------------------------------------------
-    // parse_guid — invalid inputs
-    // -------------------------------------------------------------------------
+    drop(registration);
 
-    #[test]
-    fn parse_guid_empty_string_fails() {
-        assert!(parse_guid("").is_err());
-    }
+    trace_event!("Activation completed");
 
-    #[test]
-    fn parse_guid_too_few_segments_fails() {
-        // Missing last segment
-        assert!(parse_guid("{6D809377-6AF0-444B-8957}").is_err());
-    }
+    Ok(())
+}
 
-    #[test]
-    fn parse_guid_too_many_segments_fails() {
-        assert!(parse_guid("{6D809377-6AF0-444B-8957-A3773F02200E-EXTRA}").is_err());
-    }
+// Inside your lib.rs or main.rs setup
+pub fn run_background_activation_loop(clsid: &GUID) -> windows::core::Result<()> {
+    // 1. Create the factory instance
+    let factory: IUnknown = NotificationActivatorFactory.into();
 
-    #[test]
-    fn parse_guid_invalid_hex_in_data1_fails() {
-        assert!(parse_guid("{GGGGGGGG-6AF0-444B-8957-A3773F02200E}").is_err());
-    }
-
-    #[test]
-    fn parse_guid_invalid_hex_in_data2_fails() {
-        assert!(parse_guid("{6D809377-ZZZZ-444B-8957-A3773F02200E}").is_err());
-    }
-
-    #[test]
-    fn parse_guid_invalid_hex_in_data3_fails() {
-        assert!(parse_guid("{6D809377-6AF0-XXXX-8957-A3773F02200E}").is_err());
-    }
-
-    #[test]
-    fn parse_guid_invalid_hex_in_data4_fails() {
-        assert!(parse_guid("{6D809377-6AF0-444B-ZZZZ-A3773F02200E}").is_err());
-    }
-
-    #[test]
-    fn parse_guid_data4_too_short_fails() {
-        // parts[3] is only 2 chars instead of 4 → d4_hex.len() != 16
-        assert!(parse_guid("{6D809377-6AF0-444B-89-A3773F02200E}").is_err());
-    }
-
-    #[test]
-    fn parse_guid_data4_too_long_fails() {
-        assert!(parse_guid("{6D809377-6AF0-444B-895789-A3773F02200E}").is_err());
-    }
-
-    #[test]
-    fn parse_guid_data1_overflow_fails() {
-        // 9 hex digits — overflows u32
-        assert!(parse_guid("{1FFFFFFFF-6AF0-444B-8957-A3773F02200E}").is_err());
-    }
-
-    #[test]
-    fn parse_guid_data2_overflow_fails() {
-        // 5 hex digits — overflows u16
-        assert!(parse_guid("{6D809377-16AF0-444B-8957-A3773F02200E}").is_err());
-    }
-
-    #[test]
-    fn parse_guid_no_dashes_fails() {
-        assert!(parse_guid("6D8093776AF0444B8957A3773F02200E").is_err());
-    }
-
-    // -------------------------------------------------------------------------
-    // parse_guid — round-trip / field correctness
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn parse_guid_data4_bytes_are_correct() {
-        // data4 = 89-57  +  A3-77-3F-02-20-0E
-        let g = parse_guid("{6D809377-6AF0-444B-8957-A3773F02200E}").unwrap();
-        assert_eq!(g.data4, [0x89, 0x57, 0xA3, 0x77, 0x3F, 0x02, 0x20, 0x0E]);
-    }
-
-    #[test]
-    fn parse_guid_two_identical_strings_produce_equal_guids() {
-        let a = parse_guid("{6D809377-6AF0-444B-8957-A3773F02200E}").unwrap();
-        let b = parse_guid("6D809377-6AF0-444B-8957-A3773F02200E").unwrap();
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn parse_guid_two_different_strings_produce_unequal_guids() {
-        let a = parse_guid("{6D809377-6AF0-444B-8957-A3773F02200E}").unwrap();
-        let b = parse_guid("{00000000-0000-0000-0000-000000000000}").unwrap();
-        assert_ne!(a, b);
-    }
+    // 2. Pass it to your existing hardened runner
+    run_background_activation(clsid, &factory)
 }

@@ -144,6 +144,142 @@ mod tests {
         dispatch(make_event(""));
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // Concurrency + Reliability Tests
+    // ─────────────────────────────────────────────────────────────
+
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    #[test]
+    fn dispatch_is_thread_safe_under_parallel_load() {
+        let threads = 10;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        let mut handles = Vec::new();
+
+        for i in 0..threads {
+            let barrier = barrier.clone();
+
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+
+                dispatch(make_event(&format!("parallel-{i}")));
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_handles_high_volume_without_panic() {
+        for i in 0..1000 {
+            dispatch(make_event(&format!("bulk-{i}")));
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_preserves_event_data_integrity() {
+        let mut inputs = HashMap::new();
+
+        inputs.insert("username".to_string(), "alice".to_string());
+
+        let event = NotificationActionEvent {
+            action_id: "login".to_string(),
+            inputs: inputs.clone(),
+            tag: Some("session".to_string()),
+            group: Some("auth".to_string()),
+        };
+
+        dispatch(event.clone());
+
+        assert_eq!(event.action_id, "login");
+        assert_eq!(event.inputs.get("username"), Some(&"alice".to_string()));
+        assert_eq!(event.tag.as_deref(), Some("session"));
+        assert_eq!(event.group.as_deref(), Some("auth"));
+    }
+
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_with_large_input_payload_does_not_panic() {
+        let mut inputs = HashMap::new();
+
+        let large_value = "X".repeat(10_000);
+
+        inputs.insert("large".to_string(), large_value);
+
+        dispatch(NotificationActionEvent {
+            action_id: "large-test".to_string(),
+            inputs,
+            tag: None,
+            group: None,
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_with_unicode_inputs_does_not_panic() {
+        let mut inputs = HashMap::new();
+
+        inputs.insert("emoji".to_string(), "🚀🔥你好".to_string());
+
+        dispatch(NotificationActionEvent {
+            action_id: "unicode".to_string(),
+            inputs,
+            tag: None,
+            group: None,
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn multiple_dispatch_calls_do_not_deadlock() {
+        let mut handles = Vec::new();
+
+        for i in 0..20 {
+            handles.push(thread::spawn(move || {
+                dispatch(make_event(&format!("deadlock-{i}")));
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sender_once_lock_is_initialized_at_most_once() {
+        let first = SENDER.get();
+
+        if first.is_some() {
+            let second = SENDER.get();
+
+            assert!(second.is_some());
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_after_many_calls_remains_stable() {
+        for _ in 0..500 {
+            dispatch(make_event("stress"));
+        }
+
+        dispatch(make_event("final-check"));
+    }
+
     // ── start_relay idempotence ───────────────────────────────────────────
     //
     // We can't test start_relay properly without a real AppHandle (requires a

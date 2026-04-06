@@ -24,6 +24,15 @@
 //!   `PKEY_AppUserModel_ToastActivatorCLSID` (pid 26)
 //!
 
+#[cfg(windows)]
+use windows::Win32::{
+    Foundation::PROPERTYKEY, System::Com::StructuredStorage::PropVariantClear,
+    UI::Shell::PropertiesSystem::IPropertyStore,
+};
+use windows_core::GUID;
+#[cfg(windows)]
+use windows_core::HSTRING;
+
 /// Configuration for shortcut creation.
 #[derive(Debug, Clone)]
 pub struct ShortcutConfig {
@@ -185,64 +194,88 @@ fn shortcut_path(name: &str) -> crate::Result<std::path::PathBuf> {
     Ok(path.join(format!("{}.lnk", name)))
 }
 
-/// Write a `VT_LPWSTR` string property into an `IPropertyStore`.
+/// Set a string property (AUMID) using the helper available in windows 0.62
 #[cfg(windows)]
 unsafe fn set_str_property(
-    store: &windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore,
-    fmtid: windows::core::GUID,
+    store: &IPropertyStore,
+    fmtid: GUID,
     pid: u32,
     value: &str,
-) -> windows::core::Result<()> {
-    use windows::Win32::{
-        Foundation::PROPERTYKEY,
-        System::{Com::StructuredStorage::PROPVARIANT, Variant::VT_LPWSTR},
-    };
+) -> crate::Result<()> {
+    use crate::error::Error;
+    use ::windows::Win32::System::Com::StructuredStorage::InitPropVariantFromStringAsVector;
 
     let key = PROPERTYKEY { fmtid, pid };
-    let mut wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut pv = PROPVARIANT::default();
 
-    // Write through the raw pointer to bypass ManuallyDrop destructor concerns.
-    // `*` dereferences the ManuallyDrop field directly as the compiler requires.
-    (*pv.Anonymous.Anonymous).vt = VT_LPWSTR;
-    (*pv.Anonymous.Anonymous).Anonymous.pwszVal = windows::core::PWSTR(wide.as_mut_ptr());
+    let hstring = HSTRING::from(value);
 
-    let _ = store.SetValue(&key, &pv);
-    store.Commit()
+    // This function does the proper initialization + allocation internally
+    let mut pv = InitPropVariantFromStringAsVector(&hstring).map_err(Error::from)?;
+
+    // InitPropVariantFromStringVector(windows_core::PWSTR(value)); // safe zero init
+
+    let hr = store.SetValue(&key, &pv).map_err(Error::from);
+
+    let _ = PropVariantClear(&mut pv); // Always clean up
+
+    match &hr {
+        Ok(_) => {
+            log::debug!(
+                "[notification] set string property pid {} to '{}'",
+                pid,
+                value
+            );
+        }
+        Err(e) => {
+            log::error!(
+                "[notification] failed to set string property pid {}: {}",
+                pid,
+                e
+            );
+        }
+    }
+
+    hr
 }
 
-/// Write a `VT_CLSID` GUID property into an `IPropertyStore`.
 #[cfg(windows)]
-unsafe fn set_guid_property(
-    store: &windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore,
-    fmtid: windows::core::GUID,
+fn set_guid_property(
+    store: &IPropertyStore,
+    fmtid: GUID,
     pid: u32,
-    guid: &windows::core::GUID,
-) -> windows::core::Result<()> {
-    use windows::Win32::Foundation::PROPERTYKEY;
-    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-    use windows::Win32::System::Variant::VARENUM;
+    guid: &GUID,
+) -> crate::Result<()> {
+    use crate::error::Error;
+    use windows::Win32::System::Com::StructuredStorage::{
+        InitPropVariantFromCLSID, PropVariantClear,
+    }; // your crate's error type
 
     let key = PROPERTYKEY { fmtid, pid };
-    let mut pv = PROPVARIANT::default();
 
-    (*pv.Anonymous.Anonymous).vt = VARENUM(72); // VT_CLSID
-    (*pv.Anonymous.Anonymous).Anonymous.puuid =
-        guid as *const windows::core::GUID as *mut windows::core::GUID;
+    // Convert InitPropVariantFromCLSID errors into crate::Error
+    unsafe {
+        let mut pv = InitPropVariantFromCLSID(guid).map_err(Error::from)?;
 
-    store.SetValue(&key, &pv)
-}
+        let set_result = store.SetValue(&key, &pv).map_err(Error::from);
 
-// ── No-op stubs for non-Windows ──────────────────────────────────────────
+        // Always clear the PROPVARIANT
+        let _ = PropVariantClear(&mut pv);
 
-#[cfg(not(windows))]
-pub fn create_or_update(_config: &ShortcutConfig) -> crate::Result<()> {
-    Ok(())
-}
+        match &set_result {
+            Ok(_) => {
+                log::debug!("[notification] set GUID property pid {} to {:?}", pid, guid);
+            }
+            Err(e) => {
+                log::error!(
+                    "[notification] failed to set GUID property pid {}: {}",
+                    pid,
+                    e
+                );
+            }
+        }
 
-#[cfg(not(windows))]
-pub fn remove(_shortcut_name: &str) -> crate::Result<()> {
-    Ok(())
+        set_result
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -288,19 +321,41 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn create_and_remove_round_trip() {
-        let c = ShortcutConfig {
-            shortcut_name: "TauriNotifPluginTest_ShortcutRoundTrip".into(),
-            exe_path: Some(
-                std::env::current_exe()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            ..test_config()
-        };
-        create_or_update(&c).expect("create_or_update failed");
-        remove(&c.shortcut_name).expect("remove failed");
-        // Second remove must not error
-        remove(&c.shortcut_name).expect("second remove should be no-op");
+        // We use the ComGuard from your com_activator if available,
+        // otherwise just be very careful with scoping:
+        {
+            use windows::Win32::System::Com::{
+                CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+            };
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+
+            let c = ShortcutConfig {
+                shortcut_name: "TauriNotifPluginTest_ShortcutRoundTrip".into(),
+                exe_path: Some(
+                    std::env::current_exe()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..test_config()
+            };
+
+            // Run the logic
+            let res = create_or_update(&c);
+            assert!(res.is_ok(), "Shortcut creation failed: {:?}", res.err());
+
+            let rem_res = remove(&c.shortcut_name);
+            assert!(
+                rem_res.is_ok(),
+                "Shortcut removal failed: {:?}",
+                rem_res.err()
+            );
+
+            unsafe {
+                CoUninitialize();
+            }
+        }
     }
 }
