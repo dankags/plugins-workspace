@@ -252,8 +252,18 @@ pub(crate) fn esc(s: &str) -> String {
 }
 
 /// Build the `<audio>` element from the notification's sound / silent fields.
-/// `is_looping` should be true for alarm and reminder scenarios, which use
-/// `duration="long"` and require the audio to loop for the duration.
+///
+/// `is_looping` should be true for alarm and reminder scenarios.
+///
+/// # Custom file sounds and double-play prevention
+///
+/// When `sound` is a filename (`.wav`, `.mp3`, `.ogg`, `.flac`), the
+/// `sound_player` module plays it via rodio in a background thread.
+/// In that case we emit `<audio silent="true"/>` so the Windows toast
+/// notification system does not *also* play its own sound on top of ours.
+///
+/// ms-winsoundevent names (no extension, e.g. "Notification.Default") are
+/// left entirely to the toast XML — rodio never touches them.
 fn build_audio(data: &NotificationData, is_looping: bool) -> String {
     if data.silent {
         return "<audio silent=\"true\"/>".to_string();
@@ -274,18 +284,30 @@ fn build_audio(data: &NotificationData, is_looping: bool) -> String {
             }
         }
         Some(sound) => {
-            // Treat the string "silent" as a silent flag
+            // "silent" string → silence the toast
             if sound.eq_ignore_ascii_case("silent") {
                 return "<audio silent=\"true\"/>".to_string();
             }
-            if sound.ends_with(".wav") || sound.contains('\\') || sound.contains('/') {
-                format!("<audio src=\"{}\" loop=\"{loop_attr}\"/>", esc(sound))
-            } else {
-                format!(
-                    "<audio src=\"ms-winsoundevent:Notification.{}\" loop=\"{loop_attr}\"/>",
-                    esc(sound)
-                )
+
+            // Custom file sound (.wav / .mp3 / .ogg / .flac) — rodio plays it
+            // via sound_player; silence the toast so Windows doesn't double-play.
+            let lower = sound.to_ascii_lowercase();
+            let is_file = lower.ends_with(".wav")
+                || lower.ends_with(".mp3")
+                || lower.ends_with(".ogg")
+                || lower.ends_with(".flac")
+                || sound.contains('\\')
+                || sound.contains('/');
+
+            if is_file {
+                return "<audio silent=\"true\"/>".to_string();
             }
+
+            // ms-winsoundevent name — let the toast handle it
+            format!(
+                "<audio src=\"ms-winsoundevent:Notification.{}\" loop=\"{loop_attr}\"/>",
+                esc(sound)
+            )
         }
     }
 }

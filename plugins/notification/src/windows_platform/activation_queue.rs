@@ -131,8 +131,8 @@ pub fn load_queue() {
     if let Ok(data) = fs::read_to_string(queue_file()) {
         match serde_json::from_str::<VecDeque<QueuedActivation>>(&data) {
             Ok(queue) => {
-                let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                 let mut d = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+                let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
 
                 // CRITICAL: reset existing state
                 q.clear();
@@ -159,30 +159,17 @@ pub fn load_queue() {
 // ============================================================
 
 pub fn enqueue(id: String, payload: NotificationActionEvent) {
-    // lock DEDUP again inside the overflow branch — a potential deadlock if
-    // any other code path holds DEDUP while waiting for QUEUE.
-    //
-    //   Phase 1: check dedup with only DEDUP held (release before touching QUEUE)
-    //   Phase 2: mutate QUEUE alone, collecting any evicted id
-    //   Phase 3: update DEDUP with only DEDUP held
-    // No two locks are ever held simultaneously.
+    // Atomic check-and-insert under both locks to prevent TOCTOU race.
+    // Lock order: DEDUP then QUEUE (consistent across all code paths).
 
-    // Phase 1 — dedup check
-    {
-        let dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+    let (evicted_id, snapshot): (Option<String>, VecDeque<QueuedActivation>) = {
+        let mut dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+
         if dedup.contains(&id) {
             trace_event!("Duplicate activation ignored");
             return;
         }
-    } // DEDUP released
-
-    //  clone the queue data inside the lock (fast — memory copy), release
-    // the lock, then write the snapshot to disk outside the lock. The clone
-    // is O(n) in the number of queued items but each item is a small struct,
-    // so for the realistic MAX_QUEUE_SIZE=512 this is negligible compared to
-    // any I/O wait.
-    let (evicted_id, snapshot): (Option<String>, VecDeque<QueuedActivation>) = {
-        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
 
         let evicted = if queue.len() >= MAX_QUEUE_SIZE {
             trace_event!("Queue overflow — dropping oldest");
@@ -198,20 +185,18 @@ pub fn enqueue(id: String, payload: NotificationActionEvent) {
         };
 
         queue.push_back(activation);
-        let snapshot = queue.clone(); // clone while locked (fast)
+        dedup.insert(id.clone());
+        let snapshot = queue.clone();
         (evicted, snapshot)
-    }; // QUEUE lock released — disk write happens below
+    }; // Both locks released
 
     // Persist outside the lock so slow I/O never blocks other threads.
     save_queue(&snapshot);
 
-    // Phase 3 — update DEDUP (single lock, no nesting)
-    {
+    // Remove evicted id from DEDUP after persistence.
+    if let Some(evicted) = evicted_id {
         let mut dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(evicted) = evicted_id {
-            dedup.remove(&evicted);
-        }
-        dedup.insert(id);
+        dedup.remove(&evicted);
     }
 
     append_journal("Activation queued");
@@ -304,21 +289,18 @@ fn process(act: QueuedActivation) {
 // ============================================================
 
 fn requeue(act: QueuedActivation) {
-    //  keep DEDUP in sync — re-insert id before pushing back.
-    //  clone snapshot inside lock, write outside (same as enqueue).
+    // Lock order: DEDUP then QUEUE.
     let snapshot: Option<VecDeque<QueuedActivation>> = {
-        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        if queue.len() < MAX_QUEUE_SIZE {
-            {
-                let mut dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
-                dedup.insert(act.id.clone());
-            }
-            queue.push_back(act);
-            Some(queue.clone()) // clone while locked
+        let mut d = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if q.len() < MAX_QUEUE_SIZE {
+            d.insert(act.id.clone());
+            q.push_back(act);
+            Some(q.clone())
         } else {
             None // queue full — item dropped, DEDUP stays clear
         }
-    }; // QUEUE lock released
+    }; // Both locks released
 
     if let Some(snap) = snapshot {
         save_queue(&snap); // disk write outside the lock
@@ -344,14 +326,11 @@ pub fn flush() -> crate::Result<()> {
     trace_event!("Flushing activation queue");
 
     {
-        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        queue.clear();
-        save_queue(&queue);
-    }
-
-    {
-        let mut dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
-        dedup.clear();
+        let mut d = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        q.clear();
+        d.clear();
+        save_queue(&q);
     }
 
     Ok(())
@@ -593,10 +572,7 @@ mod tests {
         // "id0" must no longer be in DEDUP, so re-enqueuing it should succeed
         enqueue("id0".into(), make_event("re-enqueued"));
 
-        let dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            dedup.contains("id0"),
-            "re-enqueued id0 should be back in DEDUP"
-        );
+        let d = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(d.contains("id0"), "re-enqueued id0 should be back in DEDUP");
     }
 }

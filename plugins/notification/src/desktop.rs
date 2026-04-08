@@ -51,6 +51,13 @@ impl<R: Runtime> crate::NotificationBuilder<R> {
         // upstream: original notify_rust path for macOS / Linux (unchanged)
         #[cfg(not(windows))]
         {
+            // Play custom bundled sound before showing the notification.
+            // On non-Windows platforms the OS notification daemon does not read
+            // from our resource directory, so we handle playback here via rodio.
+            if let Some(ref sound) = self.data.sound {
+                crate::windows_platform::sound_player::play(&self.app, sound, self.data.silent);
+            }
+
             let mut notification = imp::Notification::new(self.app.config().identifier.clone());
 
             if let Some(title) = self

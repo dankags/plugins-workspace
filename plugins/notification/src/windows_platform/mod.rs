@@ -25,6 +25,7 @@ pub mod registry_installer;
 pub mod runtime_context;
 pub mod shortcut_creator;
 pub mod shutdown;
+pub mod sound_player;
 pub mod version;
 pub mod xml_builder;
 
@@ -43,6 +44,16 @@ pub fn show<R: Runtime>(
         ver.display_name(),
         data.tag
     );
+
+    // Play a custom bundled sound file (if any) in a background thread.
+    // This runs on ALL tiers and ALL platforms so the caller never needs
+    // to touch rodio.  The sound_player respects data.silent and "silent"
+    // string values, and skips ms-winsoundevent names (those are handled
+    // by the toast XML's <audio> element on Windows).
+    if let Some(ref sound) = data.sound {
+        sound_player::play(app, sound, data.silent);
+    }
+
     match ver {
         WindowsVersion::Win7 => tier::win7::show(data, app),
         WindowsVersion::Win8 => tier::win8::show(data, identifier),
