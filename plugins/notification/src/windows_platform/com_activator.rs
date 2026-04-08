@@ -281,16 +281,35 @@ impl InstanceGuard {
             return Err(Error::from_thread());
         }
 
+        let handle = handle.unwrap();
+
         let err = unsafe { GetLastError() };
 
         if err == ERROR_ALREADY_EXISTS {
-            trace_event!("Instance already running");
-            return Err(Error::from_thread());
+            // the previous instance may still be shutting down
+            // (e.g. its RAII guard is queued for drop but the OS hasn't released
+            // the mutex yet). Wait up to 3 seconds for it to finish rather than
+            // failing immediately — this covers the rapid-relaunch window.
+            trace_event!("Instance mutex already exists — waiting for previous instance");
+
+            let wait_result = unsafe {
+                WaitForSingleObject(handle, 3000 /* ms */)
+            };
+
+            // WAIT_OBJECT_0 = 0x0 — we now own the mutex
+            if wait_result.0 != 0 {
+                // Timed out or abandoned — still log and fail cleanly
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                trace_event!("Previous instance did not release mutex in time");
+                return Err(Error::from(E_FAIL));
+            }
+
+            trace_event!("Acquired instance mutex after waiting");
         }
 
-        Ok(Self {
-            handle: handle.unwrap(),
-        })
+        Ok(Self { handle })
     }
 }
 
@@ -425,7 +444,20 @@ pub fn register(clsid: &GUID, factory: &IUnknown) -> windows::core::Result<ComRe
 
     initialize_com_security()?;
 
-    validate_threading_model(ThreadingModel::STA)?;
+    // validate_threading_model(STA) was called unconditionally,
+    // but ComGuard::new() succeeds with initialized_here=false when COM was
+    // already initialised as MTA by another part of the process. In that case
+    // validate_threading_model would return an error, register_with_retry would
+    // exhaust all retries, and the COM server would silently never register.
+    //
+    // We only enforce the STA requirement when WE initialised COM (i.e., when
+    // the guard tells us it is a fresh init). If COM was already running we
+    // trust the existing apartment and skip the check — Windows will reject
+    // CoRegisterClassObject with the appropriate HRESULT if it truly cannot
+    // work, giving a clear error rather than a misleading threading-model one.
+    if guard.initialized_here {
+        validate_threading_model(ThreadingModel::STA)?;
+    }
 
     let cookie =
         unsafe { CoRegisterClassObject(clsid, factory, CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE)? };

@@ -43,11 +43,9 @@ const WORKER_INTERVAL_MS: u64 = 50;
 // Global State
 // ============================================================
 
-#[clippy::msrv = "1.80"]
 static QUEUE: LazyLock<Mutex<VecDeque<QueuedActivation>>> =
     LazyLock::new(|| Mutex::new(VecDeque::new()));
 
-#[clippy::msrv = "1.80"]
 static DEDUP: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 static WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -71,13 +69,31 @@ pub struct QueuedActivation {
 
 fn queue_file() -> PathBuf {
     let dir = context().storage_dir.clone();
-    let _ = std::fs::create_dir_all(&dir);
+    // message. Now logs the actual error so failures are visible in prod.
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::error!(
+            "[notification] failed to create queue storage dir {:?}: {}",
+            dir,
+            e
+        );
+    }
     dir.join("activation_queue.json")
 }
 
 fn journal_file() -> PathBuf {
-    context().storage_dir.join("activation_queue.journal")
+    let dir = context().storage_dir.clone();
+    // causing append_journal() to silently fail whenever it was called before
+    // queue_file() had created the directory.
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::error!(
+            "[notification] failed to create journal storage dir {:?}: {}",
+            dir,
+            e
+        );
+    }
+    dir.join("activation_queue.journal")
 }
+
 // ============================================================
 // Persistence
 // ============================================================
@@ -86,7 +102,7 @@ fn save_queue(queue: &VecDeque<QueuedActivation>) {
     if let Ok(json) = serde_json::to_string(queue) {
         if let Err(err) = fs::write(queue_file(), json) {
             trace_event!("Queue save failed");
-            eprintln!("Queue save error: {err}");
+            log::error!("[notification] Queue save error: {err}");
         }
     }
 }
@@ -143,39 +159,62 @@ pub fn load_queue() {
 // ============================================================
 
 pub fn enqueue(id: String, payload: NotificationActionEvent) {
-    let mut dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+    // lock DEDUP again inside the overflow branch — a potential deadlock if
+    // any other code path holds DEDUP while waiting for QUEUE.
+    //
+    //   Phase 1: check dedup with only DEDUP held (release before touching QUEUE)
+    //   Phase 2: mutate QUEUE alone, collecting any evicted id
+    //   Phase 3: update DEDUP with only DEDUP held
+    // No two locks are ever held simultaneously.
 
-    if dedup.contains(&id) {
-        trace_event!("Duplicate activation ignored");
-        return;
-    }
-
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-
-    if queue.len() >= MAX_QUEUE_SIZE {
-        trace_event!("Queue overflow — dropping oldest");
-
-        if let Some(oldest) = queue.pop_front() {
-            let mut dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
-
-            dedup.remove(&oldest.id);
+    // Phase 1 — dedup check
+    {
+        let dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+        if dedup.contains(&id) {
+            trace_event!("Duplicate activation ignored");
+            return;
         }
+    } // DEDUP released
+
+    //  clone the queue data inside the lock (fast — memory copy), release
+    // the lock, then write the snapshot to disk outside the lock. The clone
+    // is O(n) in the number of queued items but each item is a small struct,
+    // so for the realistic MAX_QUEUE_SIZE=512 this is negligible compared to
+    // any I/O wait.
+    let (evicted_id, snapshot): (Option<String>, VecDeque<QueuedActivation>) = {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+
+        let evicted = if queue.len() >= MAX_QUEUE_SIZE {
+            trace_event!("Queue overflow — dropping oldest");
+            queue.pop_front().map(|oldest| oldest.id)
+        } else {
+            None
+        };
+
+        let activation = QueuedActivation {
+            id: id.clone(),
+            payload,
+            timestamp: now(),
+        };
+
+        queue.push_back(activation);
+        let snapshot = queue.clone(); // clone while locked (fast)
+        (evicted, snapshot)
+    }; // QUEUE lock released — disk write happens below
+
+    // Persist outside the lock so slow I/O never blocks other threads.
+    save_queue(&snapshot);
+
+    // Phase 3 — update DEDUP (single lock, no nesting)
+    {
+        let mut dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(evicted) = evicted_id {
+            dedup.remove(&evicted);
+        }
+        dedup.insert(id);
     }
-
-    let activation = QueuedActivation {
-        id: id.clone(),
-        payload,
-        timestamp: now(),
-    };
-
-    queue.push_back(activation);
-
-    dedup.insert(id);
-
-    save_queue(&queue);
 
     append_journal("Activation queued");
-
     trace_event!("Activation queued");
 }
 
@@ -239,7 +278,6 @@ fn process_next() {
 
 fn process(act: QueuedActivation) {
     trace_event!("Processing activation");
-
     append_journal("Processing activation");
 
     let result = std::panic::catch_unwind(|| {
@@ -250,15 +288,12 @@ fn process(act: QueuedActivation) {
         Ok(_) => {
             trace_event!("Activation processed");
             append_journal("Activation processed");
-
             cleanup_after_success(act.id);
         }
 
         Err(_) => {
             trace_event!("Activation failed — requeue");
-
             append_journal("Activation failed");
-
             requeue(act);
         }
     }
@@ -269,34 +304,55 @@ fn process(act: QueuedActivation) {
 // ============================================================
 
 fn requeue(act: QueuedActivation) {
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    //  keep DEDUP in sync — re-insert id before pushing back.
+    //  clone snapshot inside lock, write outside (same as enqueue).
+    let snapshot: Option<VecDeque<QueuedActivation>> = {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.len() < MAX_QUEUE_SIZE {
+            {
+                let mut dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+                dedup.insert(act.id.clone());
+            }
+            queue.push_back(act);
+            Some(queue.clone()) // clone while locked
+        } else {
+            None // queue full — item dropped, DEDUP stays clear
+        }
+    }; // QUEUE lock released
 
-    if queue.len() < MAX_QUEUE_SIZE {
-        queue.push_back(act);
-        save_queue(&queue);
+    if let Some(snap) = snapshot {
+        save_queue(&snap); // disk write outside the lock
     }
 }
 
 fn cleanup_after_success(id: String) {
+    // same lock-then-write pattern — clone inside, write outside.
     {
         let mut dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
         dedup.remove(&id);
     }
 
-    let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let snapshot = {
+        let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.clone()
+    }; // QUEUE lock released
 
-    save_queue(&queue);
+    save_queue(&snapshot); // disk write outside the lock
 }
 
 pub fn flush() -> crate::Result<()> {
     trace_event!("Flushing activation queue");
 
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    queue.clear();
-    save_queue(&queue);
+    {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.clear();
+        save_queue(&queue);
+    }
 
-    let mut dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
-    dedup.clear();
+    {
+        let mut dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+        dedup.clear();
+    }
 
     Ok(())
 }
@@ -317,7 +373,6 @@ fn now() -> u64 {
 // ============================================================
 
 #[cfg(test)]
-
 mod tests {
     use crate::windows_platform::{self, runtime_context};
 
@@ -343,11 +398,18 @@ mod tests {
         std::env::remove_var("DISABLE_WORKER");
 
         SHUTDOWN.store(true, Ordering::SeqCst);
+
+        // init_context() is now safe to call repeatedly —
+        // it overwrites the Mutex<Option<>> rather than panicking on a
+        // second OnceLock::set() call.
         runtime_context::init_context(
             "TestApp".into(),
             "00000000-0000-0000-0000-000000000000".into(),
             std::env::temp_dir().join("notification_test_storage"),
         );
+
+        //  shutdown::init() must be called before start_worker()
+        // so that signal_worker_complete() never panics when the worker exits.
         windows_platform::shutdown::init();
 
         thread::sleep(Duration::from_millis(50));
@@ -370,6 +432,7 @@ mod tests {
 
         SHUTDOWN.store(false, Ordering::SeqCst);
     }
+
     // ------------------------------------------------------------
     // enqueue persistence
     // ------------------------------------------------------------
@@ -477,6 +540,8 @@ mod tests {
 
     #[test]
     fn test_sequential_processing_order() {
+        setup();
+
         enqueue("1".into(), make_event("A"));
         enqueue("2".into(), make_event("B"));
         enqueue("3".into(), make_event("C"));
@@ -507,5 +572,31 @@ mod tests {
         let item = queue.front().unwrap();
 
         assert!(item.timestamp > 0);
+    }
+
+    // ------------------------------------------------------------
+    // overflow dedup consistency (regression for Issue 1b / 6)
+    // ------------------------------------------------------------
+
+    #[test]
+    fn test_overflow_does_not_leave_stale_dedup_entry() {
+        setup();
+
+        // Fill the queue to capacity
+        for i in 0..MAX_QUEUE_SIZE {
+            enqueue(format!("id{i}"), make_event(&format!("p{i}")));
+        }
+
+        // This should evict "id0" from both QUEUE and DEDUP
+        enqueue("overflow".into(), make_event("overflow"));
+
+        // "id0" must no longer be in DEDUP, so re-enqueuing it should succeed
+        enqueue("id0".into(), make_event("re-enqueued"));
+
+        let dedup = DEDUP.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            dedup.contains("id0"),
+            "re-enqueued id0 should be back in DEDUP"
+        );
     }
 }

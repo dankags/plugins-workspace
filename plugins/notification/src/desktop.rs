@@ -23,7 +23,7 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
             log::info!("[notification] process started for background activation — running pump");
             // Keep the process alive until Windows delivers the COM Activate() callback.
             // The COM server is registered in lib.rs setup() before desktop::init() runs.
-            crate::windows_platform::background_activation::run_pump(5000);
+            crate::windows_platform::background_activation::run_pump(10000);
         }
     }
 

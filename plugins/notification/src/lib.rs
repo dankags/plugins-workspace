@@ -332,14 +332,15 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                             "failed to locate local data directory"
                         ))
                     })?
-                    .join(format!("tauri-notification-{}", app.config().identifier))
+                    .join(app.config().identifier.clone())
                     .join(&app_name)
-                    .join(&guid_str);
+                    .join(guid_str.trim_start_matches('{').trim_end_matches('}'));
                 std::fs::create_dir_all(&storage_dir).map_err(|e| {
                     tauri::Error::Anyhow(anyhow::anyhow!(
                         "failed to create notification storage directory: {e}"
                     ))
                 })?;
+
                 windows_platform::runtime_context::init_context(app_name, guid_str, storage_dir);
 
                 // Detect background launch FIRST
@@ -388,6 +389,13 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     // Restore queue
                     windows_platform::activation_queue::load_queue();
 
+                    // shutdown::init() MUST be called before
+                    // start_worker(). The worker thread calls
+                    // signal_worker_complete() on exit; that function used
+                    // .get().expect() and panicked when init() hadn't run yet.
+                    // init() is idempotent (get_or_init) so this is always safe.
+                    windows_platform::shutdown::init();
+
                     // Start worker to process queued activation
                     windows_platform::activation_queue::start_worker();
 
@@ -403,6 +411,11 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 log::debug!("[notification] foreground initialization");
 
                 windows_platform::activation_queue::load_queue();
+
+                // same fix for foreground path — init() before
+                // start_worker() to avoid a potential panic if the queue is
+                // empty and the worker exits before anything else runs.
+                windows_platform::shutdown::init();
 
                 windows_platform::activation_queue::start_worker();
 

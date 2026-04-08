@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 #[derive(Debug)]
 pub struct ActivationContext {
@@ -8,18 +8,44 @@ pub struct ActivationContext {
     pub storage_dir: PathBuf,
 }
 
-static CONTEXT: OnceLock<ActivationContext> = OnceLock::new();
+// was OnceLock<ActivationContext> which panics on the second
+// call to init_context() within the same process (all test cases share statics).
+// Changed to OnceLock<Mutex<Option<...>>> so that init_context() can overwrite
+// the value freely — including between test runs — without panicking.
+static CONTEXT: OnceLock<Mutex<Option<ActivationContext>>> = OnceLock::new();
 
-pub fn init_context(app_name: String, guid: String, storage_dir: PathBuf) {
-    CONTEXT
-        .set(ActivationContext {
-            app_name,
-            guid,
-            storage_dir,
-        })
-        .expect("ActivationContext initialized twice");
+fn slot() -> &'static Mutex<Option<ActivationContext>> {
+    CONTEXT.get_or_init(|| Mutex::new(None))
 }
 
-pub fn context() -> &'static ActivationContext {
-    CONTEXT.get().expect("ActivationContext not initialized")
+/// Initialize (or reinitialize) the activation context.
+///
+/// Safe to call multiple times — subsequent calls overwrite the previous value.
+/// This is required for test isolation where each test calls `setup()`.
+pub fn init_context(app_name: String, guid: String, storage_dir: PathBuf) {
+    *slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(ActivationContext {
+        app_name,
+        guid,
+        storage_dir,
+    });
+}
+
+/// Borrow the activation context for the duration of the guard's lifetime.
+///
+/// Panics if `init_context` has not been called yet.
+pub fn context() -> impl std::ops::Deref<Target = ActivationContext> + 'static {
+    ContextGuard(slot().lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+// ── Internal guard wrapper ────────────────────────────────────────────────
+
+struct ContextGuard(MutexGuard<'static, Option<ActivationContext>>);
+
+impl std::ops::Deref for ContextGuard {
+    type Target = ActivationContext;
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("ActivationContext not initialized — call init_context() first")
+    }
 }

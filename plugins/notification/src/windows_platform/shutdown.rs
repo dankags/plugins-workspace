@@ -16,9 +16,13 @@ pub fn init() {
 }
 
 pub fn signal_worker_complete() {
-    let coord = COORDINATOR
-        .get()
-        .expect("ShutdownCoordinator not initialized");
+    // was `.get().expect(...)` which panics if init() was not
+    // called before the worker thread exits. Changed to get_or_init so that
+    // signal_worker_complete() is safe to call regardless of call order.
+    let coord = COORDINATOR.get_or_init(|| ShutdownCoordinator {
+        completed: Mutex::new(false),
+        condvar: Condvar::new(),
+    });
 
     let mut done = coord.completed.lock().unwrap();
     *done = true;
@@ -27,9 +31,12 @@ pub fn signal_worker_complete() {
 }
 
 pub fn wait_for_completion(timeout: Duration) -> bool {
-    let coord = COORDINATOR
-        .get()
-        .expect("ShutdownCoordinator not initialized");
+    // same get_or_init pattern for consistency — if somehow
+    // wait_for_completion is called before init(), it should not panic.
+    let coord = COORDINATOR.get_or_init(|| ShutdownCoordinator {
+        completed: Mutex::new(false),
+        condvar: Condvar::new(),
+    });
 
     let done = coord.completed.lock().unwrap();
 
@@ -81,5 +88,17 @@ fn graceful_shutdown() {
 
     log::debug!("[notification] background shutdown complete");
 
-    std::process::exit(0);
+    // std::process::exit(0) bypasses all Rust destructors,
+    // which means InstanceGuard::drop() never runs and the named Windows mutex
+    // "Global\\Tauri.Notification.COM" leaks until the OS releases it.
+    // On a rapid second launch this causes ERROR_ALREADY_EXISTS and the COM
+    // server fails to register (Issue 2).
+    //
+    // We return normally here instead. The background process will exit
+    // naturally once this thread and the worker thread both finish.
+    // If a hard exit is truly required (e.g. Tauri does not exit cleanly in
+    // background mode), call plugin_unregister() first so InstanceGuard is
+    // already dropped before exit:
+    //
+    //     std::process::exit(0);  // ← only if absolutely necessary
 }
