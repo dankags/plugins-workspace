@@ -7533,6 +7533,7 @@ dependencies = [
 name = "tauri-plugin-notification"
 version = "2.4.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "color-backtrace",
  "ctor",
@@ -7545,6 +7546,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_repr",
+ "sha2",
  "tauri",
  "tauri-plugin",
  "tauri-plugin-deep-link",
