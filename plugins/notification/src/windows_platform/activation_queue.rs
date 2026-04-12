@@ -283,8 +283,11 @@ pub fn load_queue() {
     let guid = ctx.guid.clone();
     drop(ctx);
 
+    println!("Initializing the load_queue");
+
     let path = queue_file(&dir);
     if !path.exists() {
+        println!("❌ [load_queue] queue file already exists.");
         return;
     }
 
@@ -292,6 +295,7 @@ pub fn load_queue() {
         Ok(b) => b,
         Err(e) => {
             log::warn!("[notification] queue read failed: {}", e);
+            println!("❌ [load_queue] [notification] queue read failed: {}", e);
             return;
         }
     };
@@ -302,6 +306,7 @@ pub fn load_queue() {
             log::warn!(
                 "[notification] queue decryption failed — discarding (tampered or wrong key)"
             );
+            println!("❌ [load_queue] [notification] queue decryption failed — discarding (tampered or wrong key)");
             let _ = fs::remove_file(&path); // remove corrupt/stale file
             return;
         }
@@ -312,6 +317,10 @@ pub fn load_queue() {
         Err(e) => {
             log::warn!(
                 "[notification] queue deserialization failed: {} — discarding",
+                e
+            );
+            println!(
+                "❌ [load_queue] [notification] queue deserialization failed: {} — discarding",
                 e
             );
             let _ = fs::remove_file(&path);
@@ -352,11 +361,13 @@ pub fn enqueue(id: String, payload: NotificationActionEvent) {
 
         if state.seen.contains(&id) {
             trace_event!("Duplicate activation ignored");
+            println!("Duplicate activation ignored");
             return;
         }
 
         if state.items.len() >= MAX_QUEUE_SIZE {
             trace_event!("Queue overflow — dropping oldest");
+            println!("Queue overflow — dropping oldest");
             if let Some(oldest) = state.items.pop_front() {
                 state.seen.remove(&oldest.id);
             }
@@ -394,6 +405,7 @@ pub fn enqueue(id: String, payload: NotificationActionEvent) {
 pub fn start_worker() {
     if std::env::var("DISABLE_WORKER").is_ok() {
         trace_event!("Worker disabled by environment");
+        println!("❌ [start_worker] Worker disabled by environment");
         return;
     }
 
@@ -468,6 +480,7 @@ pub fn start_worker() {
             .spawn(move || {
                 trace_event!("Activation worker started");
                 append_journal("Worker started");
+                println!("✔ [start_worker] Activation worker started");
 
                 loop {
                     // Block until an item is available OR shutdown is set.
@@ -478,6 +491,9 @@ pub fn start_worker() {
                             if SHUTDOWN.load(Ordering::Acquire) {
                                 trace_event!("Worker shutdown signal received");
                                 append_journal("Worker stopped");
+
+                                println!("🔁 [start_worker] Worker shutdown signal received");
+
                                 WORKER_RUNNING.store(false, Ordering::SeqCst);
                                 shutdown::signal_worker_complete();
                                 return;

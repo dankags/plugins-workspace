@@ -111,6 +111,10 @@ pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
                     "[notification] relaying action event: action_id={}",
                     event.action_id
                 );
+                println!(
+                    "[notification] relaying action event: action_id={}",
+                    event.action_id
+                );
                 if let Err(e) = app.emit(EVENT_NAME, &event) {
                     log::error!("[notification] failed to emit action event: {e}");
                     println!("⚠️ Failed to emit notification action event: {e}");
