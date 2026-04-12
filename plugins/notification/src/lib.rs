@@ -472,6 +472,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
 
                     if let Err(e) = windows_platform::registry_installer::install(&reg_config) {
                         log::error!("[notification] Registry installation failed: {e}");
+                        println!("❌ Registry installation failed: {e}");
                     }
 
                     let shortcut_config = windows_platform::shortcut_creator::ShortcutConfig {
@@ -481,7 +482,12 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                         exe_path: None,
                     };
 
-                    let _ = windows_platform::shortcut_creator::create_or_update(&shortcut_config);
+                    if let Err(e) =
+                        windows_platform::shortcut_creator::create_or_update(&shortcut_config)
+                    {
+                        log::warn!("[notification] Shortcut creation failed: {e}");
+                        println!("⚠️ Shortcut creation failed: {e}");
+                    }
                 }
 
                 #[cfg(feature = "deep-link")]
