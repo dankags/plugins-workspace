@@ -284,10 +284,12 @@ pub fn load_queue() {
     drop(ctx);
 
     println!("Initializing the load_queue");
+    println!("Storage directory: {:?}", dir);
+    print!("GUID: {} ({} bytes)\n", guid, guid.as_bytes().len());
 
     let path = queue_file(&dir);
     if !path.exists() {
-        println!("❌ [load_queue] queue file already exists.");
+        println!("❌ [load_queue] queue file does not exist.");
         return;
     }
 
