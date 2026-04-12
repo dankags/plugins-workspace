@@ -73,6 +73,7 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
         data: *const NOTIFICATION_USER_INPUT_DATA,
         count: u32,
     ) -> Result<()> {
+        println!("Hello the windows Notification activator is running.");
         let result = std::panic::catch_unwind(|| {
             let raw_args = unsafe { invoked_args.to_string().unwrap_or_default() };
 
@@ -93,12 +94,11 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
 
             let id = uuid::Uuid::new_v4().to_string();
 
-            crate::windows_platform::activation_queue::enqueue(
-                id,
-                crate::windows_platform::activation_bridge::to_action_event(
-                    crate::windows_platform::activation_bridge::ActivationEvent { inputs, ..ev },
-                ),
+            let event = crate::windows_platform::activation_bridge::to_action_event(
+                crate::windows_platform::activation_bridge::ActivationEvent { inputs, ..ev },
             );
+
+            crate::windows_platform::activation_queue::enqueue(id, event);
         });
 
         result.map_err(|_| Error::from(E_FAIL))
@@ -291,6 +291,7 @@ impl InstanceGuard {
             // the mutex yet). Wait up to 3 seconds for it to finish rather than
             // failing immediately — this covers the rapid-relaunch window.
             trace_event!("Instance mutex already exists — waiting for previous instance");
+            println!("⚠️ Warning: another instance of the COM activator is already running. Waiting for it to exit...");
 
             let wait_result = unsafe {
                 WaitForSingleObject(handle, 3000 /* ms */)
@@ -303,6 +304,7 @@ impl InstanceGuard {
                     let _ = CloseHandle(handle);
                 }
                 trace_event!("Previous instance did not release mutex in time");
+                println!("⚠️ Warning: previous instance did not exit in time. This instance will now exit to avoid collision.");
                 return Err(Error::from(E_FAIL));
             }
 
@@ -386,6 +388,7 @@ impl ComGuard {
                 hr if hr.is_ok() => {
                     COM_INITIALIZED.with(|f| f.set(true));
                     trace_event!("COM initialized");
+                    println!("COM initialized successfully for this thread.");
 
                     Ok(Self {
                         initialized_here: true,
@@ -394,6 +397,7 @@ impl ComGuard {
 
                 hr if hr == RPC_E_CHANGED_MODE => {
                     trace_event!("COM already initialized with different model");
+                    println!("⚠️ Warning: COM already initialized with a different threading model. This may cause issues with background activation. Attempting to continue anyway.");
 
                     Ok(Self {
                         initialized_here: false,
@@ -414,6 +418,7 @@ impl Drop for ComGuard {
             }
 
             trace_event!("COM uninitialized");
+            println!("COM uninitialized for this thread.");
         }
     }
 }

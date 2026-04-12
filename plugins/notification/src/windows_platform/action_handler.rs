@@ -40,6 +40,11 @@ pub fn dispatch(event: NotificationActionEvent) {
         event.action_id
     );
 
+    println!(
+        "✔ Dispatching notification action: id={}, inputs={:?}, tag={:?}, group={:?}",
+        event.action_id, event.inputs, event.tag, event.group
+    );
+
     match SENDER.get() {
         Some(tx) => {
             log::debug!("[notification] sending to relay channel");
@@ -50,10 +55,12 @@ pub fn dispatch(event: NotificationActionEvent) {
             // preserves the "exactly-once delivery" guarantee.
             if tx.send(event).is_err() {
                 log::error!("[notification] relay channel closed — relay thread has exited");
+                println!("⚠️ Warning: failed to dispatch notification action event because the relay thread has exited. ");
             }
         }
         None => {
             log::warn!("[notification] ❌ SENDER is None — relay never started!");
+            println!("⚠️ Warning: notification action received but relay thread is not running. Event data: id={}, inputs={:?}, tag={:?}, group={:?}", event.action_id, event.inputs, event.tag, event.group);
         }
     }
 }
@@ -65,6 +72,7 @@ pub fn dispatch(event: NotificationActionEvent) {
 /// available. Safe to call multiple times — subsequent calls are no-ops.
 pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
     trace_event!("notification::start_relay initializing");
+    println!("🔔 Initializing notification action relay...");
 
     // SENDER.set(tx). If SENDER was already set (second call to start_relay
     // in the same process — e.g. background activation path), set() returned
@@ -78,6 +86,7 @@ pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
     // orphaned, and that the existing live channel is always used.
     if SENDER.get().is_some() {
         trace_event!("notification::start_relay already initialized — skipping");
+        println!("notification::start_relay already initialized — skipping");
         return;
     }
 
@@ -86,6 +95,7 @@ pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
     if SENDER.set(tx).is_err() {
         // Lost a race with another caller — the channel we just created is
         // unused. rx drops here cleanly; the winner's channel is live.
+        println!("⚠️ Warning: start_relay() called multiple times — this call is a no-op because the relay thread is already running. If you see this message during background activation, it means the relay thread from the initial activation is still running and will receive events as expected.");
         return;
     }
 
@@ -95,6 +105,7 @@ pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
         .spawn(move || {
             trace_event!("notification::start_relay relay thread started");
             log::debug!("[notification] action relay thread started");
+            println!("🔔 Notification action relay thread started.");
             for event in rx {
                 log::debug!(
                     "[notification] relaying action event: action_id={}",
@@ -102,9 +113,11 @@ pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
                 );
                 if let Err(e) = app.emit(EVENT_NAME, &event) {
                     log::error!("[notification] failed to emit action event: {e}");
+                    println!("⚠️ Failed to emit notification action event: {e}");
                 }
             }
             log::debug!("[notification] action relay thread exiting");
+            println!("🔕 Notification action relay thread exiting.");
         })
         .expect("failed to spawn notification action relay thread");
 }

@@ -10,6 +10,7 @@
 )]
 
 use serde::Serialize;
+use std::path::Path;
 #[cfg(mobile)]
 use tauri::plugin::PluginHandle;
 #[cfg(desktop)]
@@ -275,6 +276,30 @@ impl<R: Runtime> NotificationBuilder<R> {
     }
 }
 
+fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
+    let src = src.as_ref();
+    let dst = dst.as_ref();
+
+    if !dst.exists() {
+        std::fs::create_dir_all(dst)?;
+    }
+
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+
+        let dest_path = dst.join(entry.file_name());
+
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), dest_path)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Extensions to [`tauri::App`], [`tauri::AppHandle`], [`tauri::WebviewWindow`], [`tauri::Webview`] and [`tauri::Window`] to access the notification APIs.
 pub trait NotificationExt<R: Runtime> {
     fn notification(&self) -> &Notification<R>;
@@ -326,24 +351,40 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     .clone()
                     .unwrap_or_else(|| "default".into());
 
-                let storage_dir = dirs::data_local_dir()
-                    .ok_or_else(|| {
-                        tauri::Error::Anyhow(anyhow::anyhow!(
-                            "failed to locate local data directory"
-                        ))
-                    })?
+                // ------------------------------------------------------------
+                // STORAGE MIGRATION
+                // ------------------------------------------------------------
+
+                let base_dir = dirs::data_local_dir().ok_or_else(|| {
+                    tauri::Error::Anyhow(anyhow::anyhow!("failed to locate local data directory"))
+                })?;
+
+                let old_storage_dir = base_dir
+                    .join(format!("tauri-notification-{}", app.config().identifier))
+                    .join(&app_name)
+                    .join(guid_str.trim_start_matches('{').trim_end_matches('}'));
+
+                let storage_dir = base_dir
                     .join(app.config().identifier.clone())
                     .join(&app_name)
                     .join(guid_str.trim_start_matches('{').trim_end_matches('}'));
-                std::fs::create_dir_all(&storage_dir).map_err(|e| {
-                    tauri::Error::Anyhow(anyhow::anyhow!(
-                        "failed to create notification storage directory: {e}"
-                    ))
-                })?;
 
-                windows_platform::runtime_context::init_context(app_name, guid_str, storage_dir);
+                if old_storage_dir.exists() && !storage_dir.exists() {
+                    std::fs::create_dir_all(storage_dir.parent().unwrap())?;
+                    std::fs::rename(&old_storage_dir, &storage_dir)
+                        .or_else(|_| copy_dir_all(&old_storage_dir, &storage_dir))?;
+                }
 
-                // Detect background launch FIRST
+                windows_platform::runtime_context::init_context(
+                    app_name.clone(),
+                    guid_str.clone(),
+                    storage_dir,
+                );
+
+                // ------------------------------------------------------------
+                // DETECT LAUNCH MODE (FIRST REAL DECISION POINT)
+                // ------------------------------------------------------------
+
                 let is_bg = windows_platform::com_activator::is_background_activation_launch();
 
                 log::debug!(
@@ -351,14 +392,27 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     if is_bg { "background" } else { "foreground" }
                 );
 
+                println!(
+                    "🔁 [notification] launch mode: {}",
+                    if is_bg { "background" } else { "foreground" }
+                );
+
                 // ------------------------------------------------------------
-                // Always start relay first
+                // CORE SYSTEM INITIALIZATION (ONCE)
+                // ------------------------------------------------------------
+
+                windows_platform::activation_queue::load_queue();
+                windows_platform::shutdown::init();
+                windows_platform::activation_queue::start_worker();
+
+                // ------------------------------------------------------------
+                // RELAY (MUST START AFTER WORKER + QUEUE)
                 // ------------------------------------------------------------
 
                 windows_platform::action_handler::start_relay(app.clone());
 
                 // ------------------------------------------------------------
-                // Register COM activator
+                // COM REGISTRATION (AFTER SYSTEM IS READY)
                 // ------------------------------------------------------------
 
                 let guid: Option<GUID> = config
@@ -372,32 +426,21 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     match windows_platform::com_activator::run_background_activation_loop(guid) {
                         Ok(_) => {
                             log::debug!("[notification] Hardened COM registration active");
+                            println!("✅ COM registration active");
                         }
                         Err(e) => {
                             log::error!("[notification] COM registration failed: {e}");
+                            println!("❌ COM registration failed: {e}");
                         }
                     }
                 }
 
                 // ------------------------------------------------------------
-                // BACKGROUND PROCESS PATH
+                // BRANCH: BACKGROUND vs FOREGROUND
                 // ------------------------------------------------------------
 
                 if is_bg {
                     log::debug!("[notification] background activation process started");
-
-                    // Restore queue
-                    windows_platform::activation_queue::load_queue();
-
-                    // shutdown::init() MUST be called before
-                    // start_worker(). The worker thread calls
-                    // signal_worker_complete() on exit; that function used
-                    // .get().expect() and panicked when init() hadn't run yet.
-                    // init() is idempotent (get_or_init) so this is always safe.
-                    windows_platform::shutdown::init();
-
-                    // Start worker to process queued activation
-                    windows_platform::activation_queue::start_worker();
 
                     windows_platform::shutdown::spawn_background_exit_watcher(15);
 
@@ -405,19 +448,10 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 }
 
                 // ------------------------------------------------------------
-                // FOREGROUND PROCESS PATH
+                // FOREGROUND ONLY INITIALIZATION
                 // ------------------------------------------------------------
 
                 log::debug!("[notification] foreground initialization");
-
-                windows_platform::activation_queue::load_queue();
-
-                // same fix for foreground path — init() before
-                // start_worker() to avoid a potential panic if the queue is
-                // empty and the worker exits before anything else runs.
-                windows_platform::shutdown::init();
-
-                windows_platform::activation_queue::start_worker();
 
                 let aumid = app.config().identifier.clone();
 
@@ -447,23 +481,12 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                         exe_path: None,
                     };
 
-                    let shortcut_result =
-                        windows_platform::shortcut_creator::create_or_update(&shortcut_config);
-
-                    match shortcut_result {
-                        Ok(_) => {
-                            log::debug!("[notification] Shortcut created/updated")
-                        }
-                        Err(e) => {
-                            log::error!("[notification] Shortcut failed: {e}")
-                        }
-                    }
+                    let _ = windows_platform::shortcut_creator::create_or_update(&shortcut_config);
                 }
 
                 #[cfg(feature = "deep-link")]
                 windows_platform::activation_bridge::register_deep_link_handler(app);
             }
-
             #[cfg(mobile)]
             let notification = mobile::init(app, api)?;
             #[cfg(desktop)]
@@ -478,6 +501,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     // Clean up the COM registration safely
                     if let Err(e) = crate::windows_platform::com_activator::plugin_unregister() {
                         log::error!("[notification] COM unregistration failed: {e}");
+                        println!("❌ [notification] COM unregistration failed: {e}");
                     }
 
                     // Ensure worker thread is stopped before allowing process to exit

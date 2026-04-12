@@ -517,6 +517,7 @@ pub fn shutdown_worker() {
 fn process(act: QueuedActivation) {
     trace_event!("Processing activation");
     append_journal("Processing activation");
+    println!("🔁 Processing activation: {}", act.id);
 
     let result = std::panic::catch_unwind(|| {
         crate::windows_platform::action_handler::dispatch(act.payload.clone());
@@ -524,6 +525,7 @@ fn process(act: QueuedActivation) {
 
     match result {
         Ok(_) => {
+            println!("✔ Dispatching activation: {}", act.id);
             trace_event!("Activation processed");
             append_journal("Activation processed");
             // Item was already popped and removed from `seen` in the worker loop.
@@ -531,6 +533,7 @@ fn process(act: QueuedActivation) {
             mark_dirty();
         }
         Err(_) => {
+            println!("❌ Failed to dispatch activation: {}", act.id);
             trace_event!("Activation failed — requeue");
             append_journal("Activation failed");
             requeue(act);
