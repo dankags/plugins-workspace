@@ -330,6 +330,12 @@ pub fn load_queue() {
         }
     };
 
+    println!(
+        "✔ [load_queue] Loaded {} activations from disk",
+        loaded.len()
+    );
+    println!("Activations: {:?}", loaded);
+
     // Only now acquire the lock — purely in-memory work from here.
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     state.items.clear();
