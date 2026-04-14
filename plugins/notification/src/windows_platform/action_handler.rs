@@ -113,7 +113,9 @@ pub fn dispatch(event: NotificationActionEvent) {
     );
 
     // ── Step 1: background handler ────────────────────────────────────────
-    if is_background_activation_launch() {
+    let should_call_handler = is_background_activation_launch() || cfg!(test);
+
+    if should_call_handler {
         if let Some(handler) = BACKGROUND_HANDLER.get() {
             log::debug!("[notification] calling background handler");
             // Clone so the same event can travel the relay path below as well.
