@@ -48,7 +48,10 @@
 use std::sync::{mpsc, Arc, OnceLock};
 use tauri::{AppHandle, Emitter, Runtime};
 
-use crate::{models::NotificationActionEvent, trace_event};
+use crate::{
+    models::NotificationActionEvent, trace_event,
+    windows_platform::background_activation::is_background_activation_launch,
+};
 
 /// The Tauri event name emitted when a notification action fires.
 pub const EVENT_NAME: &str = "notification://action";
@@ -110,12 +113,17 @@ pub fn dispatch(event: NotificationActionEvent) {
     );
 
     // ── Step 1: background handler ────────────────────────────────────────
-    if let Some(handler) = BACKGROUND_HANDLER.get() {
-        log::debug!("[notification] calling background handler");
-        // Clone so the same event can travel the relay path below as well.
-        handler(event.clone());
+    if is_background_activation_launch() {
+        if let Some(handler) = BACKGROUND_HANDLER.get() {
+            log::debug!("[notification] calling background handler");
+            // Clone so the same event can travel the relay path below as well.
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler(event.clone());
+            })) {
+                log::error!("[notification] background handler panicked: {:?}", e);
+            }
+        }
     }
-
     // ── Step 2: relay channel → Tauri frontend ────────────────────────────
     match SENDER.get() {
         Some(tx) => {
