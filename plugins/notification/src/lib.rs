@@ -2,7 +2,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-//! Send message notifications (brief auto-expiring OS window element) to your user. Can also be used with the Notification Web API.
+//! Send message notifications (brief auto-expiring OS window element) to your
+//! user. Can also be used with the Notification Web API.
+//!
+//! # Background handler
+//!
+//! Register a Rust function to be called when a toast notification action
+//! arrives in a background COM-activated process (or in the foreground
+//! process, alongside the Tauri event):
+//!
+//! ```rust
+//! fn handle_background(event: tauri_plugin_notification::NotificationActionEvent) {
+//!     match event.action_id.as_str() {
+//!         "reply"   => { /* send the reply  */ }
+//!         "dismiss" => { /* mark as read    */ }
+//!         ""        => { /* body / toast tap */ }
+//!         _         => {}
+//!     }
+//! }
+//!
+//! tauri::Builder::default()
+//!     .plugin(
+//!         tauri_plugin_notification::init()
+//!             .on_background(handle_background)
+//!             .build()
+//!     )
+//!     .run(tauri::generate_context!())
+//!     .expect("error running app");
+//! ```
+//!
+//! Without `.on_background()`, the plugin still emits `notification://action`
+//! Tauri events to the JS frontend as before.
 
 #![doc(
     html_logo_url = "https://github.com/tauri-apps/tauri/raw/dev/app-icon.png",
@@ -34,7 +64,6 @@ mod commands;
 mod error;
 mod models;
 
-// new: Windows-specific modules
 #[cfg(windows)]
 pub(crate) mod windows_platform;
 
@@ -45,7 +74,10 @@ pub use desktop::Notification;
 #[cfg(mobile)]
 pub use mobile::Notification;
 
-/// The notification builder.
+// ── NotificationBuilder (per-notification) ────────────────────────────────────
+
+/// Builder for a single notification.  Obtain via
+/// [`NotificationExt::notification`] → [`Notification::builder`].
 #[derive(Debug)]
 pub struct NotificationBuilder<R: Runtime> {
     #[cfg(desktop)]
@@ -72,235 +104,265 @@ impl<R: Runtime> NotificationBuilder<R> {
         }
     }
 
-    /// Sets the notification identifier.
     pub fn id(mut self, id: i32) -> Self {
         self.data.id = id;
         self
     }
-
-    /// Identifier of the {@link Channel} that deliveres this notification.
-    ///
-    /// If the channel does not exist, the notification won't fire.
-    /// Make sure the channel exists with {@link listChannels} and {@link createChannel}.
     pub fn channel_id(mut self, id: impl Into<String>) -> Self {
         self.data.channel_id.replace(id.into());
         self
     }
-
-    /// Sets the notification title.
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.data.title.replace(title.into());
         self
     }
-
-    /// Sets the notification body.
     pub fn body(mut self, body: impl Into<String>) -> Self {
         self.data.body.replace(body.into());
         self
     }
-
-    /// Schedule this notification to fire on a later time or a fixed interval.
     pub fn schedule(mut self, schedule: Schedule) -> Self {
         self.data.schedule.replace(schedule);
         self
     }
-
-    /// Multiline text.
-    /// Changes the notification style to big text.
-    /// Cannot be used with `inboxLines`.
     pub fn large_body(mut self, large_body: impl Into<String>) -> Self {
         self.data.large_body.replace(large_body.into());
         self
     }
-
-    /// Detail text for the notification with `largeBody`, `inboxLines` or `groupSummary`.
     pub fn summary(mut self, summary: impl Into<String>) -> Self {
         self.data.summary.replace(summary.into());
         self
     }
-
-    /// Defines an action type for this notification.
-    pub fn action_type_id(mut self, action_type_id: impl Into<String>) -> Self {
-        self.data.action_type_id.replace(action_type_id.into());
+    pub fn action_type_id(mut self, id: impl Into<String>) -> Self {
+        self.data.action_type_id.replace(id.into());
         self
     }
-
-    /// Identifier used to group multiple notifications.
-    ///
-    /// <https://developer.apple.com/documentation/usernotifications/unmutablenotificationcontent/1649872-threadidentifier>
     pub fn group(mut self, group: impl Into<String>) -> Self {
         self.data.group.replace(group.into());
         self
     }
-
-    /// Instructs the system that this notification is the summary of a group on Android.
     pub fn group_summary(mut self) -> Self {
         self.data.group_summary = true;
         self
     }
-
-    /// The sound resource name for the notification.
     pub fn sound(mut self, sound: impl Into<String>) -> Self {
         self.data.sound.replace(sound.into());
         self
     }
-
-    /// Append an inbox line to the notification.
-    /// Changes the notification style to inbox.
-    /// Cannot be used with `largeBody`.
-    ///
-    /// Only supports up to 5 lines.
     pub fn inbox_line(mut self, line: impl Into<String>) -> Self {
         self.data.inbox_lines.push(line.into());
         self
     }
-
-    /// Notification icon.
-    ///
-    /// On Android the icon must be placed in the app's `res/drawable` folder.
     pub fn icon(mut self, icon: impl Into<String>) -> Self {
         self.data.icon.replace(icon.into());
         self
     }
-
-    /// Notification large icon (Android).
-    ///
-    /// The icon must be placed in the app's `res/drawable` folder.
     pub fn large_icon(mut self, large_icon: impl Into<String>) -> Self {
         self.data.large_icon.replace(large_icon.into());
         self
     }
-
-    /// Icon color on Android.
     pub fn icon_color(mut self, icon_color: impl Into<String>) -> Self {
         self.data.icon_color.replace(icon_color.into());
         self
     }
-
-    /// Append an attachment to the notification.
     pub fn attachment(mut self, attachment: Attachment) -> Self {
         self.data.attachments.push(attachment);
         self
     }
-
-    /// Adds an extra payload to store in the notification.
     pub fn extra(mut self, key: impl Into<String>, value: impl Serialize) -> Self {
         self.data
             .extra
             .insert(key.into(), serde_json::to_value(value).unwrap());
         self
     }
-
-    /// If true, the notification cannot be dismissed by the user on Android.
-    ///
-    /// An application service must manage the dismissal of the notification.
-    /// It is typically used to indicate a background task that is pending (e.g. a file download)
-    /// or the user is engaged with (e.g. playing music).
     pub fn ongoing(mut self) -> Self {
         self.data.ongoing = true;
         self
     }
-
-    /// Automatically cancel the notification when the user clicks on it.
     pub fn auto_cancel(mut self) -> Self {
         self.data.auto_cancel = true;
         self
     }
-
-    /// Changes the notification presentation to be silent on iOS (no badge, no sound, not listed).
     pub fn silent(mut self) -> Self {
         self.data.silent = true;
         self
     }
 
-    // new: Windows builder methods
-
-    /// Notification tag for WinRT history API (Windows 10+ only).
+    // Windows-specific builder methods
     pub fn tag(mut self, tag: impl Into<String>) -> Self {
         self.data.tag.replace(tag.into());
         self
     }
-
-    /// Hero image at top of toast (Windows 10+ only).
     pub fn hero_image(mut self, src: impl Into<String>) -> Self {
         self.data.hero_image.replace(src.into());
         self
     }
-
-    /// Add an interactive action button (Windows 10+ only).
     pub fn windows_action(mut self, action: WindowsAction) -> Self {
         self.data.windows_actions.push(action);
         self
     }
-
-    /// Add a text or selection input (Windows 10+ only).
     pub fn windows_input(mut self, input: WindowsInput) -> Self {
         self.data.windows_inputs.push(input);
         self
     }
-
-    /// Attach a progress bar (Windows 10 build 19041+ only).
     pub fn progress(mut self, progress: WindowsProgress) -> Self {
         self.data.progress.replace(progress);
         self
     }
-
-    /// Auto-remove after N milliseconds (Windows 10+ only).
     pub fn expiry_ms(mut self, ms: u64) -> Self {
         self.data.expiry_ms = Some(ms);
         self
     }
-
-    /// Set notification scenario (Windows 10+ only).
     pub fn scenario(mut self, scenario: WindowsScenario) -> Self {
         self.data.scenario.replace(scenario);
         self
     }
-
-    /// Set delivery priority (Windows 10+ only).
     pub fn priority(mut self, priority: WindowsPriority) -> Self {
         self.data.priority.replace(priority);
         self
     }
-
-    /// Remove from Action Center on reboot (Windows 11+ only).
     pub fn expires_on_reboot(mut self) -> Self {
         self.data.expires_on_reboot = true;
         self
     }
-
-    /// Enable background COM activation (Windows 8+ only).
     pub fn background_activation(mut self) -> Self {
         self.data.background_activation = true;
         self
     }
 }
 
-fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
-    let src = src.as_ref();
-    let dst = dst.as_ref();
+// ── NotificationPlugin (plugin-level builder) ─────────────────────────────────
 
-    if !dst.exists() {
-        std::fs::create_dir_all(dst)?;
-    }
+/// Plugin-level builder returned by [`init()`].
+///
+/// Implements `Into<TauriPlugin>` so it can be passed directly to
+/// `tauri::Builder::plugin()` without calling `.build()`.
+///
+/// `.on_background(f)` is fully optional and only meaningful on Windows.
+/// On all other platforms the handler compiles but is never called.
+///
+/// ```rust
+/// // Simplest — no handler required, no .build() required
+/// .plugin(tauri_plugin_notification::init())
+///
+/// // With a background handler
+/// .plugin(
+///     tauri_plugin_notification::init()
+///         .on_background(|event| println!("action: {}", event.action_id))
+///         .build()
+/// )
+/// ```
+pub struct NotificationPlugin<R: Runtime> {
+    background_handler: Option<Box<dyn Fn(NotificationActionEvent) + Send + Sync + 'static>>,
+    _runtime: std::marker::PhantomData<R>,
+}
 
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-
-        let dest_path = dst.join(entry.file_name());
-
-        if ty.is_dir() {
-            copy_dir_all(entry.path(), &dest_path)?;
-        } else {
-            std::fs::copy(entry.path(), dest_path)?;
+impl<R: Runtime> NotificationPlugin<R> {
+    fn new() -> Self {
+        Self {
+            background_handler: None,
+            _runtime: std::marker::PhantomData,
         }
     }
 
-    Ok(())
+    /// Register a handler called for every notification action that arrives
+    /// in the background COM-activated process (and, additionally, in the
+    /// foreground process alongside the Tauri `notification://action` event).
+    ///
+    /// The handler receives a [`NotificationActionEvent`] with:
+    /// - `action_id` — the button id you set on the `WindowsAction`, or `""`
+    ///   for a body-tap / toast dismiss.
+    /// - `inputs` — key-value map of text/selection input values.
+    /// - `tag` / `group` — the notification's tag and group for routing.
+    ///
+    /// The handler is called synchronously on the worker thread.  For
+    /// long-running work, spawn a thread inside the handler.
+    ///
+    /// Accepts any `Fn(NotificationActionEvent) + Send + Sync + 'static` —
+    /// both plain function pointers and closures that capture `Arc` state.
+    pub fn on_background<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(NotificationActionEvent) + Send + Sync + 'static,
+    {
+        self.background_handler = Some(Box::new(handler));
+        self
+    }
+
+    /// Finalize the plugin and return the `TauriPlugin`.
+    ///
+    /// Only needed when you have chained `.on_background(f)` — otherwise
+    /// `NotificationPlugin` converts to `TauriPlugin` automatically via the
+    /// `From` impl when passed to `tauri::Builder::plugin()`.
+    pub fn build(self) -> TauriPlugin<R, PluginConfig> {
+        // Register the background handler before any thread starts.
+        if let Some(handler) = self.background_handler {
+            #[cfg(windows)]
+            windows_platform::action_handler::register_background_handler(handler);
+            // On non-Windows platforms the handler is a no-op compile guard.
+            #[cfg(not(windows))]
+            let _ = handler;
+        }
+
+        build_tauri_plugin()
+    }
 }
 
-/// Extensions to [`tauri::App`], [`tauri::AppHandle`], [`tauri::WebviewWindow`], [`tauri::Webview`] and [`tauri::Window`] to access the notification APIs.
+/// Implement `From` so `NotificationPlugin` can be passed directly to
+/// `tauri::Builder::plugin()` without an explicit `.build()` call.
+///
+/// Tauri's `.plugin()` accepts any `Into<TauriPlugin<R>>`, so this conversion
+/// makes all three usage patterns valid:
+///
+/// ```rust
+/// // 1. Simplest — no handler, no explicit build() (same ergonomics as original init())
+/// .plugin(tauri_plugin_notification::init())
+///
+/// // 2. Explicit build — identical result to (1)
+/// .plugin(tauri_plugin_notification::init().build())
+///
+/// // 3. With background handler — only pattern that requires .build()
+/// .plugin(
+///     tauri_plugin_notification::init()
+///         .on_background(handle_notification)
+///         .build()
+/// )
+/// ```
+///
+/// `.on_background()` is completely optional and only meaningful on Windows.
+/// On all other platforms the handler is accepted by the type system but
+/// silently ignored at runtime.
+impl<R: Runtime> From<NotificationPlugin<R>> for TauriPlugin<R, PluginConfig> {
+    fn from(plugin: NotificationPlugin<R>) -> Self {
+        plugin.build()
+    }
+}
+
+/// Create the plugin builder.
+///
+/// Returns a [`NotificationPlugin`] which implements `Into<TauriPlugin>`,
+/// so it can be passed directly to `.plugin()` or chained with
+/// `.on_background(f)` before calling `.build()`.
+///
+/// ```rust
+/// // No handler needed — pass directly
+/// .plugin(tauri_plugin_notification::init())
+///
+/// // With a background handler (Windows only, optional everywhere)
+/// .plugin(
+///     tauri_plugin_notification::init()
+///         .on_background(|event| {
+///             println!("action: {}", event.action_id);
+///         })
+///         .build()
+/// )
+/// ```
+pub fn init<R: Runtime>() -> NotificationPlugin<R> {
+    NotificationPlugin::new()
+}
+
+// ── Extensions ────────────────────────────────────────────────────────────────
+
+/// Extensions to [`tauri::App`], [`tauri::AppHandle`], etc. to access the
+/// notification APIs.
 pub trait NotificationExt<R: Runtime> {
     fn notification(&self) -> &Notification<R>;
 }
@@ -311,22 +373,41 @@ impl<R: Runtime, T: Manager<R>> crate::NotificationExt<R> for T {
     }
 }
 
-/// Initializes the plugin.
-pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
+    let src = src.as_ref();
+    let dst = dst.as_ref();
+    if !dst.exists() {
+        std::fs::create_dir_all(dst)?;
+    }
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let dest_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+// ── Core plugin wiring ────────────────────────────────────────────────────────
+
+/// Build and return the `TauriPlugin`.  Called by `NotificationPlugin::build()`.
+fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
     Builder::<R, PluginConfig>::new("notification")
         .invoke_handler(tauri::generate_handler![
             commands::notify,
             commands::request_permission,
             commands::is_permission_granted,
-            // new: notification management
             commands::clear_notification,
             commands::clear_notification_group,
             commands::clear_all_notifications,
-            // new: Notification Listener
             commands::request_listener_access,
             commands::get_listener_access_status,
             commands::get_active_notifications,
-            // new: uninstall / cleanup
             commands::uninstall_notification_registration,
             commands::remove_notification_shortcut,
         ])
@@ -351,10 +432,8 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     .clone()
                     .unwrap_or_else(|| "default".into());
 
-                // ------------------------------------------------------------
-                // STORAGE MIGRATION
-                // ------------------------------------------------------------
-
+                // ── Storage migration ─────────────────────────────────────
+                // Migrate from the old storage path layout if present.
                 let base_dir = dirs::data_local_dir().ok_or_else(|| {
                     tauri::Error::Anyhow(anyhow::anyhow!("failed to locate local data directory"))
                 })?;
@@ -370,10 +449,28 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     .join(guid_str.trim_start_matches('{').trim_end_matches('}'));
 
                 if old_storage_dir.exists() && !storage_dir.exists() {
-                    std::fs::create_dir_all(storage_dir.parent().unwrap())?;
+                    if let Some(parent) = storage_dir.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            tauri::Error::Anyhow(anyhow::anyhow!(
+                                "failed to create storage parent: {e}"
+                            ))
+                        })?;
+                    }
                     std::fs::rename(&old_storage_dir, &storage_dir)
-                        .or_else(|_| copy_dir_all(&old_storage_dir, &storage_dir))?;
+                        .or_else(|_| copy_dir_all(&old_storage_dir, &storage_dir))
+                        .map_err(|e| {
+                            tauri::Error::Anyhow(anyhow::anyhow!(
+                                "failed to migrate notification storage: {e}"
+                            ))
+                        })?;
+                    log::info!("[notification] storage migrated to {:?}", storage_dir);
                 }
+
+                std::fs::create_dir_all(&storage_dir).map_err(|e| {
+                    tauri::Error::Anyhow(anyhow::anyhow!(
+                        "failed to create notification storage directory: {e}"
+                    ))
+                })?;
 
                 windows_platform::runtime_context::init_context(
                     app_name.clone(),
@@ -381,10 +478,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     storage_dir,
                 );
 
-                // ------------------------------------------------------------
-                // DETECT LAUNCH MODE (FIRST REAL DECISION POINT)
-                // ------------------------------------------------------------
-
+                // ── Launch mode detection ─────────────────────────────────
                 let is_bg = windows_platform::com_activator::is_background_activation_launch();
 
                 log::debug!(
@@ -392,29 +486,26 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     if is_bg { "background" } else { "foreground" }
                 );
 
-                println!(
-                    "🔁 [notification] launch mode: {}",
-                    if is_bg { "background" } else { "foreground" }
-                );
-
-                // ------------------------------------------------------------
-                // CORE SYSTEM INITIALIZATION (ONCE)
-                // ------------------------------------------------------------
-
+                // ── Core system init (both paths) ─────────────────────────
+                // Order matters:
+                //   1. load_queue   — restore persisted activations
+                //   2. shutdown::init — must precede start_worker
+                //   3. start_worker  — begins processing (uses BACKGROUND_HANDLER
+                //                      which was registered in NotificationPlugin::build)
+                //   4. start_relay   — sets SENDER before returning, so dispatch()
+                //                      finds a live channel immediately
+                //   5. COM register  — now safe to receive Activate() callbacks
                 windows_platform::activation_queue::load_queue();
                 windows_platform::shutdown::init();
                 windows_platform::activation_queue::start_worker();
 
-                // ------------------------------------------------------------
-                // RELAY (MUST START AFTER WORKER + QUEUE)
-                // ------------------------------------------------------------
-
+                // start_relay sets SENDER synchronously before returning —
+                // any COM callback that fires after this point will find SENDER
+                // populated. In background mode this relay emits to the Tauri
+                // event bus; the background handler (step 3 above) also fires.
                 windows_platform::action_handler::start_relay(app.clone());
 
-                // ------------------------------------------------------------
-                // COM REGISTRATION (AFTER SYSTEM IS READY)
-                // ------------------------------------------------------------
-
+                // ── COM registration ──────────────────────────────────────
                 let guid: Option<GUID> = config
                     .com_server_guid
                     .as_deref()
@@ -425,36 +516,25 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 if let Some(ref guid) = guid {
                     match windows_platform::com_activator::run_background_activation_loop(guid) {
                         Ok(_) => {
-                            log::debug!("[notification] Hardened COM registration active");
-                            println!("✅ COM registration active");
+                            log::debug!("[notification] COM registration active");
                         }
                         Err(e) => {
                             log::error!("[notification] COM registration failed: {e}");
-                            println!("❌ COM registration failed: {e}");
                         }
                     }
                 }
 
-                // ------------------------------------------------------------
-                // BRANCH: BACKGROUND vs FOREGROUND
-                // ------------------------------------------------------------
-
+                // ── Background process path ───────────────────────────────
                 if is_bg {
                     log::debug!("[notification] background activation process started");
-
                     windows_platform::shutdown::spawn_background_exit_watcher(15);
-
                     return Ok(());
                 }
 
-                // ------------------------------------------------------------
-                // FOREGROUND ONLY INITIALIZATION
-                // ------------------------------------------------------------
-
+                // ── Foreground-only initialization ────────────────────────
                 log::debug!("[notification] foreground initialization");
 
                 let aumid = app.config().identifier.clone();
-
                 let display_name = app
                     .config()
                     .product_name
@@ -472,7 +552,6 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
 
                     if let Err(e) = windows_platform::registry_installer::install(&reg_config) {
                         log::error!("[notification] Registry installation failed: {e}");
-                        println!("❌ Registry installation failed: {e}");
                     }
 
                     let shortcut_config = windows_platform::shortcut_creator::ShortcutConfig {
@@ -486,13 +565,13 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                         windows_platform::shortcut_creator::create_or_update(&shortcut_config)
                     {
                         log::warn!("[notification] Shortcut creation failed: {e}");
-                        println!("⚠️ Shortcut creation failed: {e}");
                     }
                 }
 
                 #[cfg(feature = "deep-link")]
                 windows_platform::activation_bridge::register_deep_link_handler(app);
             }
+
             #[cfg(mobile)]
             let notification = mobile::init(app, api)?;
             #[cfg(desktop)]
@@ -504,13 +583,9 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             if let tauri::RunEvent::Exit = event {
                 #[cfg(windows)]
                 {
-                    // Clean up the COM registration safely
                     if let Err(e) = crate::windows_platform::com_activator::plugin_unregister() {
                         log::error!("[notification] COM unregistration failed: {e}");
-                        println!("❌ [notification] COM unregistration failed: {e}");
                     }
-
-                    // Ensure worker thread is stopped before allowing process to exit
                     windows_platform::activation_queue::shutdown_worker();
                 }
             }

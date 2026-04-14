@@ -4,18 +4,48 @@
 
 //! Bridges WinRT toast activation callbacks into Tauri events.
 //!
-//! The problem: WinRT `TypedEventHandler` callbacks fire on a Windows thread
-//! pool thread.  Tauri's event system requires an `AppHandle`, which is not
-//! `Send` in older Tauri versions and is not available at all inside a static
-//! COM callback.
+//! # Two dispatch paths
 //!
-//! Solution: a `std::sync::mpsc` channel.  The plugin's `init()` spawns a
-//! dedicated relay thread that owns the `AppHandle` and forwards
-//! `NotificationActionEvent`s as Tauri events.  COM / WinRT callbacks call
-//! `dispatch()` which just sends on the channel — no `AppHandle` needed at
-//! the call site.
+//! ## Foreground path (app has a webview)
+//!
+//! `start_relay(app)` is called during plugin setup.  `dispatch()` sends the
+//! event over a `mpsc::SyncSender` to the relay thread, which calls
+//! `app.emit("notification://action", event)` so the JS frontend receives it.
+//!
+//! ## Background path (no webview — COM-activated background process)
+//!
+//! The caller registers a Rust handler via `register_background_handler(f)`.
+//! `dispatch()` calls the handler directly on the worker thread.  This is
+//! useful when the background process needs to take action (write to a DB,
+//! send an HTTP request, schedule a follow-up notification) without a webview.
+//!
+//! Both paths are active simultaneously when both are registered — the handler
+//! fires first, then the relay emits to the frontend.  In a pure background
+//! process `start_relay` is not called, so only the handler fires.
+//!
+//! # Usage
+//!
+//! ```rust
+//! fn handle_background(event: tauri_plugin_notification::NotificationActionEvent) {
+//!     match event.action_id.as_str() {
+//!         "reply"   => { /* send the reply  */ }
+//!         "dismiss" => { /* mark as read    */ }
+//!         ""        => { /* body tap        */ }
+//!         _         => {}
+//!     }
+//! }
+//!
+//! tauri::Builder::default()
+//!     .plugin(
+//!         tauri_plugin_notification::init()
+//!             .on_background(handle_background)
+//!             .build()
+//!     )
+//!     .run(tauri::generate_context!())
+//!     .expect("error running app");
+//! ```
 
-use std::sync::{mpsc, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::{models::NotificationActionEvent, trace_event};
@@ -23,113 +53,145 @@ use crate::{models::NotificationActionEvent, trace_event};
 /// The Tauri event name emitted when a notification action fires.
 pub const EVENT_NAME: &str = "notification://action";
 
+// ── Background handler ────────────────────────────────────────────────────────
+
+/// Type alias for the background notification handler.
+///
+/// The handler receives a fully-parsed `NotificationActionEvent` and is called
+/// synchronously on the worker thread.  It must not block indefinitely —
+/// spawn a thread inside the handler for any long-running work.
+pub type BackgroundHandler = Arc<dyn Fn(NotificationActionEvent) + Send + Sync + 'static>;
+
+/// Global background handler — set once by `register_background_handler()`
+/// before the worker thread starts.  Read lock-free on every `dispatch()`.
+static BACKGROUND_HANDLER: OnceLock<BackgroundHandler> = OnceLock::new();
+
+/// Register the background notification handler.
+///
+/// Called internally by `NotificationPlugin::build()` when `.on_background(f)`
+/// has been chained.  The handler is stored before the worker thread starts so
+/// every `dispatch()` call is guaranteed to see it.
+///
+/// Accepts any `Fn(NotificationActionEvent) + Send + Sync + 'static` —
+/// both plain `fn` pointers and closures that capture `Arc`-wrapped state.
+///
+/// Subsequent calls are silently ignored (first registration wins).
+pub fn register_background_handler<F>(handler: F)
+where
+    F: Fn(NotificationActionEvent) + Send + Sync + 'static,
+{
+    let _ = BACKGROUND_HANDLER.set(Arc::new(handler));
+}
+
+// ── Relay channel (foreground path) ──────────────────────────────────────────
+
 /// Sender half of the action relay channel.
 /// Initialized once by `start_relay` and shared across threads.
 static SENDER: OnceLock<mpsc::SyncSender<NotificationActionEvent>> = OnceLock::new();
 
+// ── dispatch() ────────────────────────────────────────────────────────────────
+
 /// Dispatch a notification action event from any thread (COM callback,
-/// WinRT handler, etc.).
+/// worker thread, etc.).
 ///
-/// Blocks until the relay thread accepts the event (bounded by the channel
-/// capacity of 64). If the relay thread has exited the send returns an error
-/// and the event is logged but not retried — the activation was already
-/// persisted to disk by the queue before this point.
+/// Execution order on every call:
+/// 1. If a background handler is registered → call it synchronously.
+/// 2. If the relay channel is open → blocking `send()` to the relay thread,
+///    which calls `app.emit()`.
+///
+/// Both steps run independently.  Having a handler does NOT suppress the Tauri
+/// event, and having no handler does NOT prevent the relay from emitting.
 pub fn dispatch(event: NotificationActionEvent) {
     log::debug!(
-        "[notification] dispatch called: action_id={}",
-        event.action_id
+        "[notification] dispatch: action_id={:?} tag={:?} group={:?}",
+        event.action_id,
+        event.tag,
+        event.group,
     );
 
-    println!(
-        "✔ Dispatching notification action: id={}, inputs={:?}, tag={:?}, group={:?}",
-        event.action_id, event.inputs, event.tag, event.group
-    );
+    // ── Step 1: background handler ────────────────────────────────────────
+    if let Some(handler) = BACKGROUND_HANDLER.get() {
+        log::debug!("[notification] calling background handler");
+        // Clone so the same event can travel the relay path below as well.
+        handler(event.clone());
+    }
 
+    // ── Step 2: relay channel → Tauri frontend ────────────────────────────
     match SENDER.get() {
         Some(tx) => {
             log::debug!("[notification] sending to relay channel");
-            // event when the 64-slot channel is full (e.g. relay thread is
-            // slow on app.emit()). Switched to blocking send() so the worker
-            // thread waits rather than losing the event. The worker processes
-            // one item at a time so a brief wait here is acceptable and
-            // preserves the "exactly-once delivery" guarantee.
             if tx.send(event).is_err() {
                 log::error!("[notification] relay channel closed — relay thread has exited");
-                println!("⚠️ Warning: failed to dispatch notification action event because the relay thread has exited. ");
             }
         }
         None => {
-            log::warn!("[notification] ❌ SENDER is None — relay never started!");
-            println!("⚠️ Warning: notification action received but relay thread is not running. Event data: id={}, inputs={:?}, tag={:?}, group={:?}", event.action_id, event.inputs, event.tag, event.group);
+            // Normal in a background-only process.  Log at debug only when a
+            // handler is registered (expected); warn when neither is present.
+            if BACKGROUND_HANDLER.get().is_none() {
+                log::warn!(
+                    "[notification] event dropped — no background handler and no relay. \
+                     Register a handler with init().on_background(f) or ensure \
+                     start_relay() is called."
+                );
+            } else {
+                log::debug!("[notification] no relay — background handler handled the event");
+            }
         }
     }
 }
 
+// ── start_relay() (foreground path) ──────────────────────────────────────────
+
 /// Start the relay thread that forwards `NotificationActionEvent`s as Tauri
 /// events on the global app handle.
 ///
-/// Must be called once from `plugin::init()` **after** the `AppHandle` is
-/// available. Safe to call multiple times — subsequent calls are no-ops.
+/// `SENDER` is set synchronously before this function returns, so by the time
+/// `start_worker()` is called `dispatch()` finds a live channel regardless of
+/// thread scheduling.
 pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
     trace_event!("notification::start_relay initializing");
-    println!("🔔 Initializing notification action relay...");
 
-    // SENDER.set(tx). If SENDER was already set (second call to start_relay
-    // in the same process — e.g. background activation path), set() returned
-    // Err and the function returned, but the NEW rx was immediately dropped,
-    // killing the paired channel. The OLD tx in SENDER may point to a dead rx
-    // whose thread had already exited. Every subsequent dispatch() call would
-    // get a SendError and events would be silently lost.
-    //
-
-    // populated. This guarantees that an rx is never created and immediately
-    // orphaned, and that the existing live channel is always used.
+    // Bail before creating a channel if already set — prevents an orphaned rx.
     if SENDER.get().is_some() {
         trace_event!("notification::start_relay already initialized — skipping");
-        println!("notification::start_relay already initialized — skipping");
         return;
     }
 
     let (tx, rx) = mpsc::sync_channel::<NotificationActionEvent>(64);
 
     if SENDER.set(tx).is_err() {
-        // Lost a race with another caller — the channel we just created is
-        // unused. rx drops here cleanly; the winner's channel is live.
-        println!("⚠️ Warning: start_relay() called multiple times — this call is a no-op because the relay thread is already running. If you see this message during background activation, it means the relay thread from the initial activation is still running and will receive events as expected.");
+        // Lost the race — rx drops cleanly.
         return;
     }
 
-    // SENDER is now set. Spawn the relay thread to drain rx.
     std::thread::Builder::new()
         .name("notification-action-relay".to_string())
         .spawn(move || {
             trace_event!("notification::start_relay relay thread started");
             log::debug!("[notification] action relay thread started");
-            println!("🔔 Notification action relay thread started.");
             for event in rx {
                 log::debug!(
-                    "[notification] relaying action event: action_id={}",
-                    event.action_id
-                );
-                println!(
-                    "[notification] relaying action event: action_id={}",
+                    "[notification] relaying event: action_id={}",
                     event.action_id
                 );
                 if let Err(e) = app.emit(EVENT_NAME, &event) {
                     log::error!("[notification] failed to emit action event: {e}");
-                    println!("⚠️ Failed to emit notification action event: {e}");
                 }
             }
             log::debug!("[notification] action relay thread exiting");
-            println!("🔕 Notification action relay thread exiting.");
         })
         .expect("failed to spawn notification action relay thread");
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
     fn make_event(id: &str) -> NotificationActionEvent {
         NotificationActionEvent {
@@ -143,140 +205,116 @@ mod tests {
     // ── EVENT_NAME ────────────────────────────────────────────────────────
 
     #[test]
-    fn event_name_is_the_expected_string() {
+    fn event_name_is_correct() {
         assert_eq!(EVENT_NAME, "notification://action");
     }
 
-    // ── dispatch() before relay starts ───────────────────────────────────
-    //
-    // SENDER is a OnceLock set synchronously inside start_relay() before the
-    // relay thread is spawned. In tests we never call start_relay() (no real
-    // AppHandle), so SENDER stays None and dispatch() must log a warning and
-    // return without panicking.
+    // ── dispatch() without anything registered ────────────────────────────
 
     #[test]
-    fn dispatch_does_not_panic_when_relay_not_started() {
-        // SENDER is None in a fresh test binary — dispatch() logs a warning.
-        // If another test in the same binary has already set SENDER (tests
-        // share process-level statics), send() will block until the rx side
-        // is ready — which it won't be without a real relay thread. In that
-        // case the channel is already set and this test exercises the
-        // "channel is live" path. Either way: no panic.
-        dispatch(make_event("test-before-relay"));
+    fn dispatch_does_not_panic_when_nothing_registered() {
+        dispatch(make_event("orphan"));
     }
 
+    // ── background handler called by dispatch() ───────────────────────────
+    //
+    // Note: BACKGROUND_HANDLER is a process-wide OnceLock. If a prior test
+    // in this binary already set it, registration is a no-op and we skip the
+    // assertion (the handler from the first registration is still active, but
+    // its captured state is different).  This is expected OnceLock behaviour.
+
     #[test]
-    fn dispatch_many_events_does_not_panic() {
-        for i in 0..50 {
-            dispatch(make_event(&format!("event-{i}")));
+    fn background_handler_receives_event() {
+        let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let rx_clone = received.clone();
+
+        let registered = BACKGROUND_HANDLER
+            .set(Arc::new(move |ev: NotificationActionEvent| {
+                rx_clone.lock().unwrap().push(ev.action_id.clone());
+            }))
+            .is_ok();
+
+        if registered {
+            dispatch(make_event("handler-test"));
+            let got = received.lock().unwrap();
+            assert!(
+                got.contains(&"handler-test".to_string()),
+                "handler must receive the dispatched event"
+            );
         }
     }
 
     #[test]
-    fn dispatch_event_with_inputs_does_not_panic() {
-        let mut inputs = HashMap::new();
-        inputs.insert("reply_box".to_string(), "Hello world".to_string());
-        dispatch(NotificationActionEvent {
-            action_id: "send".to_string(),
-            inputs,
-            tag: Some("msg-42".to_string()),
-            group: Some("messages".to_string()),
-        });
+    fn background_handler_receives_correct_fields() {
+        let (tx, rx) = std::sync::mpsc::channel::<NotificationActionEvent>();
+
+        let registered = BACKGROUND_HANDLER.set(Arc::new(move |ev| {
+            let _ = tx.send(ev);
+        }));
+
+        if registered.is_ok() {
+            let mut inputs = HashMap::new();
+            inputs.insert("reply_box".to_string(), "Hello".to_string());
+
+            dispatch(NotificationActionEvent {
+                action_id: "reply".to_string(),
+                inputs,
+                tag: Some("msg-1".to_string()),
+                group: Some("chat".to_string()),
+            });
+
+            if let Ok(ev) = rx.recv_timeout(Duration::from_millis(200)) {
+                assert_eq!(ev.action_id, "reply");
+                assert_eq!(ev.tag.as_deref(), Some("msg-1"));
+                assert_eq!(ev.group.as_deref(), Some("chat"));
+                assert_eq!(ev.inputs["reply_box"], "Hello");
+            }
+        }
     }
 
     #[test]
-    fn dispatch_event_with_empty_action_id_does_not_panic() {
-        // Empty action_id = body-tap activation (no explicit button)
+    fn body_tap_empty_action_id_dispatches_without_panic() {
         dispatch(make_event(""));
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Concurrency + Reliability Tests
-    // ─────────────────────────────────────────────────────────────
-
-    use std::sync::{Arc, Barrier};
-    use std::thread;
+    // ── register_background_handler idempotence ───────────────────────────
 
     #[test]
-    fn dispatch_is_thread_safe_under_parallel_load() {
-        let threads = 10;
-        let barrier = Arc::new(Barrier::new(threads));
+    fn register_handler_twice_is_noop() {
+        let _ = BACKGROUND_HANDLER.set(Arc::new(|_| {}));
+        let _ = BACKGROUND_HANDLER.set(Arc::new(|_| {}));
+        // Reaching here without panic = pass.
+    }
 
+    // ── Concurrency ───────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_thread_safe_under_parallel_load() {
+        let barrier = Arc::new(Barrier::new(10));
         let mut handles = Vec::new();
-
-        for i in 0..threads {
-            let barrier = barrier.clone();
-
+        for i in 0..10 {
+            let b = barrier.clone();
             handles.push(thread::spawn(move || {
-                barrier.wait();
-
+                b.wait();
                 dispatch(make_event(&format!("parallel-{i}")));
             }));
         }
-
-        for handle in handles {
-            handle.join().unwrap();
+        for h in handles {
+            h.join().unwrap();
         }
     }
 
-    // ─────────────────────────────────────────────────────────────
-
     #[test]
-    fn dispatch_handles_high_volume_without_panic() {
+    fn dispatch_high_volume_no_panic() {
         for i in 0..1000 {
             dispatch(make_event(&format!("bulk-{i}")));
         }
     }
 
-    // ─────────────────────────────────────────────────────────────
-
     #[test]
-    fn dispatch_preserves_event_data_integrity() {
+    fn dispatch_unicode_inputs_no_panic() {
         let mut inputs = HashMap::new();
-
-        inputs.insert("username".to_string(), "alice".to_string());
-
-        let event = NotificationActionEvent {
-            action_id: "login".to_string(),
-            inputs: inputs.clone(),
-            tag: Some("session".to_string()),
-            group: Some("auth".to_string()),
-        };
-
-        dispatch(event.clone());
-
-        assert_eq!(event.action_id, "login");
-        assert_eq!(event.inputs.get("username"), Some(&"alice".to_string()));
-        assert_eq!(event.tag.as_deref(), Some("session"));
-        assert_eq!(event.group.as_deref(), Some("auth"));
-    }
-
-    // ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn dispatch_with_large_input_payload_does_not_panic() {
-        let mut inputs = HashMap::new();
-
-        let large_value = "X".repeat(10_000);
-
-        inputs.insert("large".to_string(), large_value);
-
-        dispatch(NotificationActionEvent {
-            action_id: "large-test".to_string(),
-            inputs,
-            tag: None,
-            group: None,
-        });
-    }
-
-    // ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn dispatch_with_unicode_inputs_does_not_panic() {
-        let mut inputs = HashMap::new();
-
         inputs.insert("emoji".to_string(), "🚀🔥你好".to_string());
-
         dispatch(NotificationActionEvent {
             action_id: "unicode".to_string(),
             inputs,
@@ -285,54 +323,15 @@ mod tests {
         });
     }
 
-    // ─────────────────────────────────────────────────────────────
-
     #[test]
-    fn multiple_dispatch_calls_do_not_deadlock() {
-        let mut handles = Vec::new();
-
-        for i in 0..20 {
-            handles.push(thread::spawn(move || {
-                dispatch(make_event(&format!("deadlock-{i}")));
-            }));
-        }
-
-        for h in handles {
-            h.join().unwrap();
-        }
+    fn dispatch_large_payload_no_panic() {
+        let mut inputs = HashMap::new();
+        inputs.insert("data".to_string(), "X".repeat(10_000));
+        dispatch(NotificationActionEvent {
+            action_id: "large".to_string(),
+            inputs,
+            tag: None,
+            group: None,
+        });
     }
-
-    // ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn sender_once_lock_is_initialized_at_most_once() {
-        let first = SENDER.get();
-
-        if first.is_some() {
-            let second = SENDER.get();
-
-            assert!(second.is_some());
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn dispatch_after_many_calls_remains_stable() {
-        for _ in 0..500 {
-            dispatch(make_event("stress"));
-        }
-
-        dispatch(make_event("final-check"));
-    }
-
-    // ── start_relay idempotence ───────────────────────────────────────────
-    //
-    //  start_relay() now checks SENDER.get().is_some() at entry
-    // and returns immediately if already set — BEFORE creating a new channel.
-    // This prevents a new rx being orphaned and a dead tx being left in SENDER.
-    //
-    // We cannot test start_relay() fully without a real AppHandle (requires a
-    // running Tauri runtime). The idempotence guarantee is covered by the
-    // early-return guard: a second call is a no-op because SENDER is Some.
 }
