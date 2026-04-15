@@ -111,13 +111,17 @@ pub fn dispatch(event: NotificationActionEvent) {
         event.tag,
         event.group,
     );
-
+    println!("[notification] dispatch: action_id={:?} tag={:?} group={:?}",
+        event.action_id,
+        event.tag,
+        event.group,);
     // ── Step 1: background handler ────────────────────────────────────────
     let should_call_handler = is_background_activation_launch() || cfg!(test);
 
     if should_call_handler {
         if let Some(handler) = BACKGROUND_HANDLER.get() {
             log::debug!("[notification] calling background handler");
+            println!("[notification] calling background handler");
             // Clone so the same event can travel the relay path below as well.
             if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 handler(event.clone());
@@ -132,6 +136,7 @@ pub fn dispatch(event: NotificationActionEvent) {
             log::debug!("[notification] sending to relay channel");
             if tx.send(event).is_err() {
                 log::error!("[notification] relay channel closed — relay thread has exited");
+                println!("[notification] relay channel closed — relay thread has exited");
             }
         }
         None => {
@@ -143,8 +148,12 @@ pub fn dispatch(event: NotificationActionEvent) {
                      Register a handler with init().on_background(f) or ensure \
                      start_relay() is called."
                 );
+                println!("[notification] event dropped — no background handler and no relay. \
+                     Register a handler with init().on_background(f) or ensure \
+                     start_relay() is called.");
             } else {
                 log::debug!("[notification] no relay — background handler handled the event");
+                println!("[notification] no relay — background handler handled the event");
             }
         }
     }
@@ -164,6 +173,7 @@ pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
     // Bail before creating a channel if already set — prevents an orphaned rx.
     if SENDER.get().is_some() {
         trace_event!("notification::start_relay already initialized — skipping");
+        println!("notification::start_relay already initialized — skipping");
         return;
     }
 
@@ -186,9 +196,11 @@ pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
                 );
                 if let Err(e) = app.emit(EVENT_NAME, &event) {
                     log::error!("[notification] failed to emit action event: {e}");
+                    println!("[notification] failed to emit action event: {e}");
                 }
             }
             log::debug!("[notification] action relay thread exiting");
+            println!("[notification] action relay thread exiting");
         })
         .expect("failed to spawn notification action relay thread");
 }
