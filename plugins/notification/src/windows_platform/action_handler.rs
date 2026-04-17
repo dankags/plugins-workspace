@@ -189,11 +189,14 @@ pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
         .spawn(move || {
             trace_event!("notification::start_relay relay thread started");
             log::debug!("[notification] action relay thread started");
+            println!("[notification] action relay thread started");
             for event in rx {
                 log::debug!(
                     "[notification] relaying event: action_id={}",
                     event.action_id
                 );
+                 println!("[notification] relaying event: action_id={}",
+                    event.action_id);
                 if let Err(e) = app.emit(EVENT_NAME, &event) {
                     log::error!("[notification] failed to emit action event: {e}");
                     println!("[notification] failed to emit action event: {e}");

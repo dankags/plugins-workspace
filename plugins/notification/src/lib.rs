@@ -491,6 +491,8 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     "[notification] launch mode: {}",
                     if is_bg { "background" } else { "foreground" }
                 );
+                println!( "[notification] launch mode: {}",
+                    if is_bg { "background" } else { "foreground" });
 
                 // ── Core system init (both paths) ─────────────────────────
                 // Order matters:
