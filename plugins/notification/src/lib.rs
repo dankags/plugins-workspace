@@ -67,6 +67,12 @@ mod models;
 #[cfg(windows)]
 pub(crate) mod windows_platform;
 
+// sound_player is part of windows_platform on Windows (exposed via mod.rs).
+// On non-Windows desktop platforms it lives at the crate root so desktop.rs
+// can reference it as crate::sound_player without a platform guard.
+#[cfg(all(desktop, not(windows)))]
+pub(crate) mod sound_player;
+
 pub use error::{Error, Result};
 
 #[cfg(desktop)]

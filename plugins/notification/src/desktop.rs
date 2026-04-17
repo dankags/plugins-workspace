@@ -14,19 +14,9 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     app: &AppHandle<R>,
     _api: PluginApi<R, C>,
 ) -> crate::Result<Notification<R>> {
-    // new: Windows startup tasks
-    #[cfg(windows)]
-    {
-        crate::windows_platform::action_handler::start_relay(app.clone());
-
-        if crate::windows_platform::background_activation::is_background_activation_launch() {
-            log::info!("[notification] process started for background activation — running pump");
-            // Keep the process alive until Windows delivers the COM Activate() callback.
-            // The COM server is registered in lib.rs setup() before desktop::init() runs.
-            crate::windows_platform::background_activation::run_pump(10000);
-        }
-    }
-
+    // Windows notification system initialization (start_relay, COM registration,
+    // queue setup, background pump) is handled entirely in lib.rs setup().
+    // desktop::init() only constructs the Notification handle.
     Ok(Notification(app.clone()))
 }
 
@@ -54,8 +44,9 @@ impl<R: Runtime> crate::NotificationBuilder<R> {
             // Play custom bundled sound before showing the notification.
             // On non-Windows platforms the OS notification daemon does not read
             // from our resource directory, so we handle playback here via rodio.
+            // sound_player is re-exported at the crate root for all desktop platforms.
             if let Some(ref sound) = self.data.sound {
-                crate::windows_platform::sound_player::play(&self.app, sound, self.data.silent);
+                crate::sound_player::play(&self.app, sound, self.data.silent);
             }
 
             let mut notification = imp::Notification::new(self.app.config().identifier.clone());
