@@ -441,7 +441,9 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 // ── Storage migration ─────────────────────────────────────
                 // Migrate from the old storage path layout if present.
                 let base_dir = dirs::data_local_dir().ok_or_else(|| {
-                    tauri::Error::Anyhow(anyhow::anyhow!("failed to locate local data directory"))
+                    tauri::Error::Anyhow(anyhow::anyhow!(
+                        "failed to locate local data directory"
+                    ))
                 })?;
 
                 let old_storage_dir = base_dir
@@ -485,14 +487,13 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 );
 
                 // ── Launch mode detection ─────────────────────────────────
-                let is_bg = windows_platform::com_activator::is_background_activation_launch();
+                let is_bg =
+                    windows_platform::com_activator::is_background_activation_launch();
 
                 log::debug!(
                     "[notification] launch mode: {}",
                     if is_bg { "background" } else { "foreground" }
                 );
-                println!( "[notification] launch mode: {}",
-                    if is_bg { "background" } else { "foreground" });
 
                 // ── Core system init (both paths) ─────────────────────────
                 // Order matters:
@@ -514,6 +515,27 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 windows_platform::action_handler::start_relay(app.clone());
 
                 // ── COM registration ──────────────────────────────────────
+                // run_background_activation_loop contains an internal message
+                // pump (run_pump_with_cancel) that blocks until Windows
+                // delivers the Activate() callback or the 5-second watchdog
+                // fires.
+                //
+                // On the FOREGROUND path the function returns immediately
+                // (is_background_activation_launch() == false) so calling it
+                // inline is fine.
+                //
+                // On the BACKGROUND path we must NOT call it inline because:
+                //   - It blocks for up to 5 seconds while pumping messages.
+                //   - lib.rs setup() would not reach spawn_background_exit_watcher
+                //     until AFTER Activate() has already fired and the pump
+                //     exited — the exit watcher would start too late.
+                //
+                // Fix: spawn the COM pump on a dedicated STA thread for the
+                // background path.  The thread runs the pump, receives
+                // Activate(), enqueues the activation, then exits.  The
+                // worker thread (already running) picks it up immediately.
+                // The exit watcher (started below) observes the worker
+                // completing and then shuts the process down gracefully.
                 let guid: Option<GUID> = config
                     .com_server_guid
                     .as_deref()
@@ -521,13 +543,34 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     .transpose()
                     .map_err(|e| tauri::Error::Anyhow(anyhow::anyhow!(e)))?;
 
-                if let Some(ref guid) = guid {
-                    match windows_platform::com_activator::run_background_activation_loop(guid) {
-                        Ok(_) => {
-                            log::debug!("[notification] COM registration active");
-                        }
-                        Err(e) => {
-                            log::error!("[notification] COM registration failed: {e}");
+                if let Some(guid) = guid {
+                    if is_bg {
+                        // BACKGROUND: pump runs on its own thread — setup()
+                        // returns immediately so the exit watcher can start.
+                        std::thread::Builder::new()
+                            .name("notification-com-pump".to_string())
+                            .spawn(move || {
+                                match windows_platform::com_activator::run_background_activation_loop(&guid) {
+                                    Ok(_) => {
+                                        log::debug!("[notification] COM background pump completed");
+                                    }
+                                    Err(e) => {
+                                        log::error!("[notification] COM background pump failed: {e}");
+                                    }
+                                }
+                            })
+                            .expect("failed to spawn notification-com-pump thread");
+                    } else {
+                        // FOREGROUND: returns instantly (not a background launch).
+                        // Registers the COM class object so foreground toast
+                        // actions are routed through our activator.
+                        match windows_platform::com_activator::run_background_activation_loop(&guid) {
+                            Ok(_) => {
+                                log::debug!("[notification] COM registration active (foreground)");
+                            }
+                            Err(e) => {
+                                log::error!("[notification] COM registration failed: {e}");
+                            }
                         }
                     }
                 }
@@ -558,20 +601,23 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                         exe_path: None,
                     };
 
-                    if let Err(e) = windows_platform::registry_installer::install(&reg_config) {
+                    if let Err(e) =
+                        windows_platform::registry_installer::install(&reg_config)
+                    {
                         log::error!("[notification] Registry installation failed: {e}");
                     }
 
-                    let shortcut_config = windows_platform::shortcut_creator::ShortcutConfig {
-                        shortcut_name: display_name,
-                        aumid,
-                        com_server_guid: Some(guid_str.clone()),
-                        exe_path: None,
-                    };
+                    let shortcut_config =
+                        windows_platform::shortcut_creator::ShortcutConfig {
+                            shortcut_name: display_name,
+                            aumid,
+                            com_server_guid: Some(guid_str.clone()),
+                            exe_path: None,
+                        };
 
-                    if let Err(e) =
-                        windows_platform::shortcut_creator::create_or_update(&shortcut_config)
-                    {
+                    if let Err(e) = windows_platform::shortcut_creator::create_or_update(
+                        &shortcut_config,
+                    ) {
                         log::warn!("[notification] Shortcut creation failed: {e}");
                     }
                 }
@@ -591,7 +637,9 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             if let tauri::RunEvent::Exit = event {
                 #[cfg(windows)]
                 {
-                    if let Err(e) = crate::windows_platform::com_activator::plugin_unregister() {
+                    if let Err(e) =
+                        crate::windows_platform::com_activator::plugin_unregister()
+                    {
                         log::error!("[notification] COM unregistration failed: {e}");
                     }
                     windows_platform::activation_queue::shutdown_worker();
