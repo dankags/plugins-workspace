@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Local};
 use windows::Win32::System::Services::{OpenSCManagerW, SC_MANAGER_CONNECT};
 use windows::{
     core::{Error, GUID, HRESULT},
@@ -187,7 +188,15 @@ pub fn write_journal(event: &str) {
         .append(true)
         .open(journal_path())
     {
-        let _ = writeln!(file, "{:?} | {}", std::time::SystemTime::now(), event);
+        let now = std::time::SystemTime::now();
+
+        let datetime: DateTime<Local> = now.into();
+        let _ = writeln!(
+            file,
+            "{:?} | {}",
+            datetime.format("%Y-%m-%d %H:%M:%S"),
+            event
+        );
 
         let _ = file.flush();
     }
@@ -528,7 +537,7 @@ pub fn register_with_retry(
             Err(err) => {
                 attempt += 1;
 
-                trace_event!("Registration failed — retrying");
+                trace_event!("Registration failed {err} — retrying");
 
                 if attempt >= retries {
                     trace_event!("Registration retries exhausted");
