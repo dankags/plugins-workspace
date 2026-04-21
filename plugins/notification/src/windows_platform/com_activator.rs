@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local};
 use windows::Win32::System::Services::{OpenSCManagerW, SC_MANAGER_CONNECT};
 use windows::{
     core::{Error, GUID, HRESULT},
@@ -188,11 +187,7 @@ pub fn write_journal(event: &str) {
         .append(true)
         .open(journal_path())
     {
-        let now = std::time::SystemTime::now();
-
-        let datetime: DateTime<Local> = now.into();
-        let dateformated = datetime.format("%Y-%m-%d %H:%M:%S");
-        let _ = writeln!(file, "{:?} | {}", dateformated, event);
+        let _ = writeln!(file, "{:?} | {}", std::time::SystemTime::now(), event);
 
         let _ = file.flush();
     }
@@ -533,9 +528,7 @@ pub fn register_with_retry(
             Err(err) => {
                 attempt += 1;
 
-                let error = err.message();
-
-                trace_event!(format!("Registration failed {error} — retrying").as_str());
+                trace_event!("Registration failed — retrying");
 
                 if attempt >= retries {
                     trace_event!("Registration retries exhausted");
@@ -669,42 +662,161 @@ pub fn run_background_activation_loop(clsid: &GUID) -> windows::core::Result<()>
 
 /// Register the COM class object for the **foreground** process.
 ///
-/// The foreground app is already running — its own Tauri/tao event loop keeps
-/// the process alive, so no blocking message pump is needed.  We only need
-/// `CoRegisterClassObject` so that Windows can deliver `Activate()` when the
-/// user clicks a `activationType="background"` toast action button while the
-/// app is in the foreground.
+/// # The threading problem
 ///
-/// The registration is stored in the global slot and revoked by
-/// `plugin_unregister()` on `RunEvent::Exit`, identical to the background path.
+/// `CoRegisterClassObject` requires a COM STA (Single-Threaded Apartment).
+/// Tauri initialises its own threads with MTA or a different apartment, so
+/// calling `register()` from the plugin setup thread fails with a threading
+/// model mismatch — which manifests as the confusing log entry:
 ///
-/// # Why this was missing
+///   `Registration failed The operation completed successfully.`
 ///
-/// `run_background_activation` returns immediately when
-/// `is_background_activation_launch()` is false, so calling it from the
-/// foreground path never reached `CoRegisterClassObject`.  Without registration,
-/// Windows had nowhere to deliver `Activate()` and toast action buttons were
-/// silently ignored while the app was running.
+/// (`S_OK` returned as an error because `validate_threading_model` rejected
+/// the call before `CoRegisterClassObject` was ever reached.)
+///
+/// # The fix
+///
+/// Spawn a dedicated OS thread that:
+/// 1. Calls `CoInitializeEx(STA)` — owns its own STA apartment
+/// 2. Calls `CoRegisterClassObject` — registers our activator
+/// 3. Stores the `ComRegistration` in the global slot
+/// 4. Runs a lightweight Win32 message pump until `GLOBAL_CANCEL` is set
+///    (which happens in `plugin_unregister()` on `RunEvent::Exit`)
+/// 5. Drops `ComRegistration` → `CoRevokeClassObject` + `CoUninitialize`
+///
+/// The pump on this thread is necessary because `CoRegisterClassObject` in STA
+/// mode requires the thread to pump messages so Windows can dispatch `Activate()`
+/// calls to it. Without pumping, `Activate()` is never delivered even though
+/// the class is registered.
+///
+/// The thread exits cleanly when `shutdown_worker()` / `plugin_unregister()`
+/// sets `GLOBAL_CANCEL`, which the pump loop observes.
 pub fn register_foreground(clsid: &GUID) -> windows::core::Result<()> {
     if is_background_activation_launch() {
-        // This function is only for the foreground path.
         return Ok(());
     }
 
-    trace_event!("Foreground COM registration starting");
+    trace_event!("Foreground COM registration starting on dedicated STA thread");
 
-    let factory: IUnknown = NotificationActivatorFactory.into();
+    // Clone the GUID so it can be moved into the thread.
+    let clsid = *clsid;
+    let cancel = cancel_token().clone();
+    cancel.store(false, Ordering::SeqCst);
 
-    let registration = register_with_retry(clsid, &factory, 3)?;
+    // A channel to signal success or failure back to the caller.
+    // We wait for the thread to confirm registration before returning so that
+    // by the time setup() continues, COM is definitely ready to receive
+    // Activate() calls.
+    let (tx, rx) = std::sync::mpsc::channel::<windows::core::Result<()>>();
 
-    {
-        let mut slot = registration_slot().lock().unwrap();
-        *slot = Some(registration);
+    std::thread::Builder::new()
+        .name("notification-com-sta".to_string())
+        .spawn(move || {
+            // ── Step 1: initialize STA on this thread ─────────────────────
+            let guard = match ComGuard::new() {
+                Ok(g) => g,
+                Err(e) => {
+                    log::error!("[notification] foreground COM init failed: {e}");
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+
+            if let Err(e) = initialize_com_security() {
+                log::warn!("[notification] CoInitializeSecurity: {e} (continuing)");
+                // Non-fatal — security may already be initialized by Tauri.
+            }
+
+            // ── Step 2: register the class object ─────────────────────────
+            let factory: IUnknown = NotificationActivatorFactory.into();
+
+            let cookie = unsafe {
+                match CoRegisterClassObject(
+                    &clsid,
+                    &factory,
+                    CLSCTX_LOCAL_SERVER,
+                    REGCLS_MULTIPLEUSE,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::error!("[notification] CoRegisterClassObject failed: {e}");
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
+            };
+
+            CLASS_REGISTERED.store(true, Ordering::SeqCst);
+            trace_event!("Foreground COM class registered on STA thread");
+            log::info!("[notification] foreground COM registration active");
+
+            // Store the registration so plugin_unregister() can revoke it.
+            // We store the cookie directly rather than a ComRegistration so the
+            // guard (and therefore CoUninitialize) stays on this thread.
+            {
+                let mut slot = registration_slot().lock().unwrap();
+                *slot = Some(ComRegistration {
+                    cookie,
+                    _guard: guard,
+                });
+            }
+
+            // Signal the caller that registration succeeded.
+            let _ = tx.send(Ok(()));
+
+            // ── Step 3: pump messages on the STA thread ────────────────────
+            // Required: the STA thread must pump Win32 messages for Windows
+            // to dispatch Activate() to it. Without this loop, the class is
+            // registered but Activate() is never called.
+            loop {
+                if cancel.load(Ordering::SeqCst) {
+                    trace_event!("Foreground COM STA pump: shutdown signal received");
+                    break;
+                }
+
+                unsafe {
+                    let mut msg = MSG::default();
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        if msg.message == WM_QUIT {
+                            trace_event!("Foreground COM STA pump: WM_QUIT received");
+                            // Take registration out of slot before returning
+                            // so Drop runs on this STA thread (correct apartment).
+                            let mut slot = registration_slot().lock().unwrap();
+                            slot.take();
+                            return;
+                        }
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            // ── Step 4: revoke registration on this STA thread ─────────────
+            // Drop must happen on the STA thread that owns the apartment.
+            // Take it out of the global slot first so plugin_unregister()
+            // does not double-revoke.
+            let reg = {
+                let mut slot = registration_slot().lock().unwrap();
+                slot.take()
+            };
+            drop(reg); // CoRevokeClassObject + CoUninitialize happen here
+
+            trace_event!("Foreground COM STA thread exiting cleanly");
+        })
+        .expect("failed to spawn notification-com-sta thread");
+
+    // Wait for registration to complete (or fail) before returning to setup().
+    // Timeout of 3 seconds — if the thread hasn't registered by then something
+    // is fundamentally wrong with the COM setup.
+    match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(result) => result,
+        Err(_) => {
+            log::error!("[notification] foreground COM registration timed out");
+            Err(windows::core::Error::from(E_FAIL))
+        }
     }
-
-    trace_event!("Foreground COM registration stored in global slot");
-
-    Ok(())
 }
 
 pub fn plugin_unregister() -> windows::core::Result<()> {
@@ -742,16 +854,32 @@ pub fn plugin_unregister() -> windows::core::Result<()> {
     // ------------------------------------------------------------
     // 4. Revoke COM class registration
     // ------------------------------------------------------------
-
+    // The cancel signal (step 1) wakes the STA pump thread, which then:
+    //   - drops ComRegistration (CoRevokeClassObject) on the correct STA thread
+    //   - calls CoUninitialize on the correct STA thread
+    //   - takes the slot itself before exiting
+    //
+    // We must NOT forcibly take/drop the ComRegistration here because
+    // ComGuard::drop() calls CoUninitialize(), which must run on the same
+    // thread that called CoInitializeEx().  Calling it from this shutdown
+    // thread is undefined behaviour in Windows COM.
+    //
+    // Instead: give the STA thread up to 500ms to self-clean, then
+    // check whether the slot is empty as a diagnostic.
     {
-        let mut slot = registration_slot().lock().unwrap();
-
-        if let Some(registration) = slot.take() {
-            drop(registration);
-
-            trace_event!("COM registration dropped");
-        } else {
-            trace_event!("No active COM registration");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let slot = registration_slot().lock().unwrap();
+            if slot.is_none() {
+                trace_event!("COM registration dropped (by STA thread)");
+                break;
+            }
+            drop(slot);
+            if std::time::Instant::now() >= deadline {
+                trace_event!("COM registration slot still occupied after 500ms — STA thread may still be pumping");
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
