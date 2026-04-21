@@ -515,27 +515,18 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 windows_platform::action_handler::start_relay(app.clone());
 
                 // ── COM registration ──────────────────────────────────────
-                // run_background_activation_loop contains an internal message
-                // pump (run_pump_with_cancel) that blocks until Windows
-                // delivers the Activate() callback or the 5-second watchdog
-                // fires.
                 //
-                // On the FOREGROUND path the function returns immediately
-                // (is_background_activation_launch() == false) so calling it
-                // inline is fine.
+                // BACKGROUND path: run_background_activation_loop() contains
+                // a blocking Win32 message pump. We spawn it on a dedicated
+                // thread so setup() returns immediately and the exit watcher
+                // can start watching before Activate() fires.
                 //
-                // On the BACKGROUND path we must NOT call it inline because:
-                //   - It blocks for up to 5 seconds while pumping messages.
-                //   - lib.rs setup() would not reach spawn_background_exit_watcher
-                //     until AFTER Activate() has already fired and the pump
-                //     exited — the exit watcher would start too late.
-                //
-                // Fix: spawn the COM pump on a dedicated STA thread for the
-                // background path.  The thread runs the pump, receives
-                // Activate(), enqueues the activation, then exits.  The
-                // worker thread (already running) picks it up immediately.
-                // The exit watcher (started below) observes the worker
-                // completing and then shuts the process down gracefully.
+                // FOREGROUND path: register_foreground() calls
+                // CoRegisterClassObject and stores the result in the global
+                // slot, then returns immediately. The Tauri/tao event loop
+                // keeps the process alive — no pump needed. Without this
+                // call the foreground process had no COM registration and
+                // Windows silently dropped every toast action click.
                 let guid: Option<GUID> = config
                     .com_server_guid
                     .as_deref()
@@ -545,32 +536,21 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
 
                 if let Some(guid) = guid {
                     if is_bg {
-                        // BACKGROUND: pump runs on its own thread — setup()
-                        // returns immediately so the exit watcher can start.
+                        // BACKGROUND: pump on its own STA thread.
                         std::thread::Builder::new()
                             .name("notification-com-pump".to_string())
                             .spawn(move || {
                                 match windows_platform::com_activator::run_background_activation_loop(&guid) {
-                                    Ok(_) => {
-                                        log::debug!("[notification] COM background pump completed");
-                                    }
-                                    Err(e) => {
-                                        log::error!("[notification] COM background pump failed: {e}");
-                                    }
+                                    Ok(_) => log::debug!("[notification] COM background pump completed"),
+                                    Err(e) => log::error!("[notification] COM background pump failed: {e}"),
                                 }
                             })
                             .expect("failed to spawn notification-com-pump thread");
                     } else {
-                        // FOREGROUND: returns instantly (not a background launch).
-                        // Registers the COM class object so foreground toast
-                        // actions are routed through our activator.
-                        match windows_platform::com_activator::run_background_activation_loop(&guid) {
-                            Ok(_) => {
-                                log::debug!("[notification] COM registration active (foreground)");
-                            }
-                            Err(e) => {
-                                log::error!("[notification] COM registration failed: {e}");
-                            }
+                        // FOREGROUND: register COM class object, no pump.
+                        match windows_platform::com_activator::register_foreground(&guid) {
+                            Ok(_) => log::debug!("[notification] COM registration active (foreground)"),
+                            Err(e) => log::error!("[notification] COM registration failed: {e}"),
                         }
                     }
                 }

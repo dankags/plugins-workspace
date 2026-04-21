@@ -38,6 +38,7 @@ use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows_core::*;
 use windows_sys::Win32::Foundation::RPC_E_TOO_LATE;
 
+use crate::trace_event;
 use crate::windows_platform::runtime_context::context;
 
 static GLOBAL_REGISTRATION: OnceLock<Mutex<Option<ComRegistration>>> = OnceLock::new();
@@ -73,11 +74,20 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
         data: *const NOTIFICATION_USER_INPUT_DATA,
         count: u32,
     ) -> Result<()> {
-        println!("Hello the windows Notification activator is running.");
+        // This log line must always appear when a toast action is clicked.
+        // If you do not see it, the issue is COM registration or toast XML,
+        // not Rust logic.
+        trace_event!("Activate() called");
+        log::info!(
+            "[notification] Activate() called — background_launch={}",
+            is_background_activation_launch()
+        );
+
         let result = std::panic::catch_unwind(|| {
             let raw_args = unsafe { invoked_args.to_string().unwrap_or_default() };
 
-            // Bridge to your plugin's logic
+            log::debug!("[notification] Activate() raw_args={:?}", raw_args);
+
             let ev = crate::windows_platform::activation_bridge::parse_background_args(&raw_args);
 
             let mut inputs = ev.inputs;
@@ -92,14 +102,42 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
                 }
             }
 
-            let id = uuid::Uuid::new_v4().to_string();
-
             let event = crate::windows_platform::activation_bridge::to_action_event(
                 crate::windows_platform::activation_bridge::ActivationEvent { inputs, ..ev },
             );
 
-            crate::windows_platform::activation_queue::enqueue(id, event);
+            log::info!(
+                "[notification] Activate() parsed — action_id={:?} tag={:?} group={:?} inputs={:?}",
+                event.action_id,
+                event.tag,
+                event.group,
+                event.inputs.keys().collect::<Vec<_>>(),
+            );
+
+            if is_background_activation_launch() {
+                // BACKGROUND PROCESS: the app has no webview / relay yet.
+                // Persist the activation to the encrypted queue so the worker
+                // thread can process it and emit it once the relay is ready.
+                let id = uuid::Uuid::new_v4().to_string();
+                crate::windows_platform::activation_queue::enqueue(id, event);
+            } else {
+                // FOREGROUND PROCESS: relay thread is already running.
+                // Dispatch directly — no queue round-trip, no disk write,
+                // no latency. The app receives the event immediately.
+                crate::windows_platform::action_handler::dispatch(event);
+            }
         });
+
+        if let Err(ref e) = result {
+            // Log the panic payload if it is a string so it appears in logs.
+            let msg = e
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("unknown panic");
+            log::error!("[notification] Activate() panicked: {}", msg);
+            trace_event!("Activate() panicked");
+        }
 
         result.map_err(|_| Error::from(E_FAIL))
     }
@@ -286,12 +324,11 @@ impl InstanceGuard {
         let err = unsafe { GetLastError() };
 
         if err == ERROR_ALREADY_EXISTS {
-            // the previous instance may still be shutting down
+            // FIX (Issue 2a): the previous instance may still be shutting down
             // (e.g. its RAII guard is queued for drop but the OS hasn't released
             // the mutex yet). Wait up to 3 seconds for it to finish rather than
             // failing immediately — this covers the rapid-relaunch window.
             trace_event!("Instance mutex already exists — waiting for previous instance");
-            println!("⚠️ Warning: another instance of the COM activator is already running. Waiting for it to exit...");
 
             let wait_result = unsafe {
                 WaitForSingleObject(handle, 3000 /* ms */)
@@ -304,7 +341,6 @@ impl InstanceGuard {
                     let _ = CloseHandle(handle);
                 }
                 trace_event!("Previous instance did not release mutex in time");
-                println!("⚠️ Warning: previous instance did not exit in time. This instance will now exit to avoid collision.");
                 return Err(Error::from(E_FAIL));
             }
 
@@ -388,7 +424,6 @@ impl ComGuard {
                 hr if hr.is_ok() => {
                     COM_INITIALIZED.with(|f| f.set(true));
                     trace_event!("COM initialized");
-                    println!("COM initialized successfully for this thread.");
 
                     Ok(Self {
                         initialized_here: true,
@@ -397,7 +432,6 @@ impl ComGuard {
 
                 hr if hr == RPC_E_CHANGED_MODE => {
                     trace_event!("COM already initialized with different model");
-                    println!("⚠️ Warning: COM already initialized with a different threading model. This may cause issues with background activation. Attempting to continue anyway.");
 
                     Ok(Self {
                         initialized_here: false,
@@ -418,7 +452,6 @@ impl Drop for ComGuard {
             }
 
             trace_event!("COM uninitialized");
-            println!("COM uninitialized for this thread.");
         }
     }
 }
@@ -449,7 +482,7 @@ pub fn register(clsid: &GUID, factory: &IUnknown) -> windows::core::Result<ComRe
 
     initialize_com_security()?;
 
-    // validate_threading_model(STA) was called unconditionally,
+    // FIX (Issue 4): validate_threading_model(STA) was called unconditionally,
     // but ComGuard::new() succeeds with initialized_here=false when COM was
     // already initialised as MTA by another part of the process. In that case
     // validate_threading_model would return an error, register_with_retry would
@@ -625,6 +658,46 @@ pub fn run_background_activation_loop(clsid: &GUID) -> windows::core::Result<()>
 
     // 2. Pass it to your existing hardened runner
     run_background_activation(clsid, &factory)
+}
+
+/// Register the COM class object for the **foreground** process.
+///
+/// The foreground app is already running — its own Tauri/tao event loop keeps
+/// the process alive, so no blocking message pump is needed.  We only need
+/// `CoRegisterClassObject` so that Windows can deliver `Activate()` when the
+/// user clicks a `activationType="background"` toast action button while the
+/// app is in the foreground.
+///
+/// The registration is stored in the global slot and revoked by
+/// `plugin_unregister()` on `RunEvent::Exit`, identical to the background path.
+///
+/// # Why this was missing
+///
+/// `run_background_activation` returns immediately when
+/// `is_background_activation_launch()` is false, so calling it from the
+/// foreground path never reached `CoRegisterClassObject`.  Without registration,
+/// Windows had nowhere to deliver `Activate()` and toast action buttons were
+/// silently ignored while the app was running.
+pub fn register_foreground(clsid: &GUID) -> windows::core::Result<()> {
+    if is_background_activation_launch() {
+        // This function is only for the foreground path.
+        return Ok(());
+    }
+
+    trace_event!("Foreground COM registration starting");
+
+    let factory: IUnknown = NotificationActivatorFactory.into();
+
+    let registration = register_with_retry(clsid, &factory, 3)?;
+
+    {
+        let mut slot = registration_slot().lock().unwrap();
+        *slot = Some(registration);
+    }
+
+    trace_event!("Foreground COM registration stored in global slot");
+
+    Ok(())
 }
 
 pub fn plugin_unregister() -> windows::core::Result<()> {
