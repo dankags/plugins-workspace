@@ -191,12 +191,8 @@ pub fn write_journal(event: &str) {
         let now = std::time::SystemTime::now();
 
         let datetime: DateTime<Local> = now.into();
-        let _ = writeln!(
-            file,
-            "{:?} | {}",
-            datetime.format("%Y-%m-%d %H:%M:%S"),
-            event
-        );
+        let dateformated = datetime.format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(file, "{:?} | {}", dateformated, event);
 
         let _ = file.flush();
     }
@@ -537,7 +533,9 @@ pub fn register_with_retry(
             Err(err) => {
                 attempt += 1;
 
-                trace_event!("Registration failed {err} — retrying");
+                let error = err.message();
+
+                trace_event!(format!("Registration failed {error} — retrying").as_str());
 
                 if attempt >= retries {
                     trace_event!("Registration retries exhausted");
