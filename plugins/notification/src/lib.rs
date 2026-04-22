@@ -580,6 +580,7 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                         icon_path: config.icon.as_ref().and_then(|v| v.first().cloned()),
                         exe_path: None,
                     };
+                    println!("icons file_path: {:?}", config.icon);
 
                     // if let Err(e) =
                     //     windows_platform::registry_installer::install(&reg_config)

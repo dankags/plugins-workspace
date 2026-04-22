@@ -90,9 +90,16 @@ pub fn uninstall(config: &RegistryConfig) -> crate::Result<()> {
 fn resolve_exe(config: &RegistryConfig) -> crate::Result<String> {
     match &config.exe_path {
         Some(p) => Ok(p.clone()),
-        None => std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .map_err(|e| crate::Error::Windows(format!("current_exe: {e}"))),
+        None => {
+            let exe = std::env::current_exe()
+                .map_err(|e| crate::Error::Windows(format!("current_exe: {e}")))?;
+
+            let exe = exe
+                .canonicalize()
+                .map_err(|e| crate::Error::Windows(format!("canonicalize: {e}")))?;
+
+            Ok(exe.to_string_lossy().into_owned())
+        }
     }
 }
 
@@ -117,6 +124,8 @@ fn install_com_server(guid: &str, exe_path: &str) -> crate::Result<()> {
     let mut disposition = REG_CREATE_KEY_DISPOSITION(0);
 
     unsafe {
+        use crate::trace_event;
+
         let status = RegCreateKeyExW(
             HKEY_CURRENT_USER,
             &key_path,
@@ -135,7 +144,12 @@ fn install_com_server(guid: &str, exe_path: &str) -> crate::Result<()> {
             )));
         }
 
-        println!("Resolved exe path: {:?}", std::env::current_exe());
+        trace_event!(&format!("Resolved exe path: {:?}", std::env::current_exe()));
+        trace_event!(&format!("Using COM server exe path: {:?}", exe_path));
+        trace_event!(&format!(
+            "Setting registry value: {:?} = {:?}",
+            key_path, exe_path
+        ));
 
         set_reg_sz(&hkey, "", exe_path)?;
 
