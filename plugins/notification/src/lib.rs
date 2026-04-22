@@ -399,6 +399,21 @@ fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result
     Ok(())
 }
 
+fn pick_icon(icons: &[String]) -> Option<String> {
+    let mut png = None;
+
+    for icon in icons {
+        if icon.ends_with(".ico") {
+            return Some(icon.clone());
+        }
+        if icon.ends_with(".png") && png.is_none() {
+            png = Some(icon.clone());
+        }
+    }
+
+    png
+}
+
 // ── Core plugin wiring ────────────────────────────────────────────────────────
 
 /// Build and return the `TauriPlugin`.  Called by `NotificationPlugin::build()`.
@@ -426,6 +441,7 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             {
                 let config: PluginConfig = api.config().clone();
                 app.manage(config.clone());
+
 
                 let app_name = app
                     .config()
@@ -573,11 +589,13 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     .unwrap_or_else(|| aumid.clone());
 
                 if let Some(ref guid_str) = config.com_server_guid {
+
+
                     let reg_config = windows_platform::registry_installer::RegistryConfig {
                         com_server_guid: guid_str.clone(),
                         aumid: aumid.clone(),
                         display_name: display_name.clone(),
-                        icon_path: config.icon.as_ref().and_then(|v| v.first().cloned()),
+                        icon_path: pick_icon(&app.config().bundle.icon),
                         exe_path: None,
                     };
                     println!("icons file_path: {:?}", config.icon);

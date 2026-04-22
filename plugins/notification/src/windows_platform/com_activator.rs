@@ -663,6 +663,7 @@ pub fn run_background_activation(clsid: &GUID, factory: &IUnknown) -> windows::c
 pub fn run_background_activation_loop(clsid: &GUID) -> windows::core::Result<()> {
     // 1. Create the factory instance
     let factory: IUnknown = NotificationActivatorFactory.into();
+    println!("This is notification factory: {:?}", factory);
 
     // 2. Pass it to your existing hardened runner
     run_background_activation(clsid, &factory)
