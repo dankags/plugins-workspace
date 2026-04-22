@@ -656,6 +656,7 @@ pub enum ListenerAccessStatus {
 pub struct PluginConfig {
     /// Stable GUID for COM background activation.
     pub com_server_guid: Option<String>,
+    pub icon: Option<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -691,6 +692,7 @@ mod tests {
     fn plugin_config_round_trips() {
         let original = PluginConfig {
             com_server_guid: Some("GUID-XYZ".to_string()),
+            icon: Some(vec!["icon1.png".to_string(), "icon2.png".to_string()]),
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: PluginConfig = serde_json::from_str(&json).unwrap();

@@ -109,6 +109,7 @@ fn install_com_server(guid: &str, exe_path: &str) -> crate::Result<()> {
         },
     };
 
+    println!("Software\\Classes\\CLSID\\{}\\LocalServer32", guid);
     let key_path = HSTRING::from(format!("Software\\Classes\\CLSID\\{}\\LocalServer32", guid));
 
     let mut hkey = HKEY::default();
@@ -133,6 +134,8 @@ fn install_com_server(guid: &str, exe_path: &str) -> crate::Result<()> {
                 "RegCreateKeyExW failed: {status:?}"
             )));
         }
+
+        println!("Resolved exe path: {:?}", std::env::current_exe());
 
         set_reg_sz(&hkey, "", exe_path)?;
 

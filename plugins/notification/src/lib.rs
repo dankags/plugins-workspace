@@ -577,15 +577,21 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                         com_server_guid: guid_str.clone(),
                         aumid: aumid.clone(),
                         display_name: display_name.clone(),
-                        icon_path: None,
+                        icon_path: config.icon.as_ref().and_then(|v| v.first().cloned()),
                         exe_path: None,
                     };
 
-                    if let Err(e) =
-                        windows_platform::registry_installer::install(&reg_config)
-                    {
-                        log::error!("[notification] Registry installation failed: {e}");
-                    }
+                    // if let Err(e) =
+                    //     windows_platform::registry_installer::install(&reg_config)
+                    // {
+                    //     println!("[notification] Registry installation failed: {e}");
+                    //     log::error!("[notification] Registry installation failed: {e}");
+                    // }
+
+                    match windows_platform::registry_installer::install(&reg_config) {
+    Ok(_) => println!("Registry install OK"),
+    Err(e) => println!("Registry install FAILED: {:?}", e),
+}
 
                     let shortcut_config =
                         windows_platform::shortcut_creator::ShortcutConfig {
@@ -598,6 +604,7 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     if let Err(e) = windows_platform::shortcut_creator::create_or_update(
                         &shortcut_config,
                     ) {
+                        println!("[notification] Shortcut creation failed: {e}");
                         log::warn!("[notification] Shortcut creation failed: {e}");
                     }
                 }
