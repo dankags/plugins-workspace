@@ -595,11 +595,21 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                         com_server_guid: guid_str.clone(),
                         aumid: aumid.clone(),
                         display_name: display_name.clone(),
-                        icon_path: pick_icon(&app.config().bundle.icon),
+                        icon_path: pick_icon(&app.config().bundle.icon)
+    .and_then(|icon| {
+        let dir = app.path().resource_dir().ok()?;
+        let path = dir.join(icon);
+        Some(path.to_string_lossy().into_owned())
+    }),
                         exe_path: None,
                     };
                     println!("app icons: {:?}", app.config().bundle.icon);
-                    println!("icons file_path: {:?}", pick_icon(&app.config().bundle.icon));
+                    println!("icons file_path: {:?}", icon_path: pick_icon(&app.config().bundle.icon)
+    .and_then(|icon| {
+        let dir = app.path().resource_dir().ok()?;
+        let path = dir.join(icon);
+        Some(path.to_string_lossy().into_owned())
+    }));
 
                     // if let Err(e) =
                     //     windows_platform::registry_installer::install(&reg_config)
