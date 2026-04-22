@@ -738,6 +738,7 @@ pub fn register_foreground(clsid: &GUID) -> windows::core::Result<()> {
 
             // ── Step 2: register the class object ─────────────────────────
             let factory: IUnknown = NotificationActivatorFactory.into();
+            println!("This is notification factory: {:?}", factory);
 
             let cookie = unsafe {
                 match CoRegisterClassObject(
