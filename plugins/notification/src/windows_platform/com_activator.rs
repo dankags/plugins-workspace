@@ -78,6 +78,7 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
         // If you do not see it, the issue is COM registration or toast XML,
         // not Rust logic.
         trace_event!("Activate() called");
+        println!("ACTIVATE CALLED");
         log::info!(
             "[notification] Activate() called — background_launch={}",
             is_background_activation_launch()
@@ -108,6 +109,13 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
 
             log::info!(
                 "[notification] Activate() parsed — action_id={:?} tag={:?} group={:?} inputs={:?}",
+                event.action_id,
+                event.tag,
+                event.group,
+                event.inputs.keys().collect::<Vec<_>>(),
+            );
+            println!(
+                "ACTIVATE PARSED: action_id={:?} tag={:?} group={:?} inputs={:?}",
                 event.action_id,
                 event.tag,
                 event.group,
