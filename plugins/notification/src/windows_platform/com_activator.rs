@@ -38,8 +38,9 @@ use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows_core::*;
 use windows_sys::Win32::Foundation::RPC_E_TOO_LATE;
 
-use crate::trace_event;
 use crate::windows_platform::runtime_context::context;
+
+use crate::trace_event;
 
 static GLOBAL_REGISTRATION: OnceLock<Mutex<Option<ComRegistration>>> = OnceLock::new();
 
@@ -78,7 +79,6 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
         // If you do not see it, the issue is COM registration or toast XML,
         // not Rust logic.
         trace_event!("Activate() called");
-        println!("ACTIVATE CALLED");
         log::info!(
             "[notification] Activate() called — background_launch={}",
             is_background_activation_launch()
@@ -109,13 +109,6 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
 
             log::info!(
                 "[notification] Activate() parsed — action_id={:?} tag={:?} group={:?} inputs={:?}",
-                event.action_id,
-                event.tag,
-                event.group,
-                event.inputs.keys().collect::<Vec<_>>(),
-            );
-            println!(
-                "ACTIVATE PARSED: action_id={:?} tag={:?} group={:?} inputs={:?}",
                 event.action_id,
                 event.tag,
                 event.group,
@@ -663,7 +656,6 @@ pub fn run_background_activation(clsid: &GUID, factory: &IUnknown) -> windows::c
 pub fn run_background_activation_loop(clsid: &GUID) -> windows::core::Result<()> {
     // 1. Create the factory instance
     let factory: IUnknown = NotificationActivatorFactory.into();
-    println!("This is notification factory: {:?}", factory);
 
     // 2. Pass it to your existing hardened runner
     run_background_activation(clsid, &factory)
@@ -738,7 +730,6 @@ pub fn register_foreground(clsid: &GUID) -> windows::core::Result<()> {
 
             // ── Step 2: register the class object ─────────────────────────
             let factory: IUnknown = NotificationActivatorFactory.into();
-            println!("This is notification factory: {:?}", factory);
 
             let cookie = unsafe {
                 match CoRegisterClassObject(

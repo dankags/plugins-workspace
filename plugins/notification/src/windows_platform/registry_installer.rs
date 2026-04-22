@@ -221,6 +221,47 @@ fn install_aumid(config: &RegistryConfig) -> crate::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+pub fn write_custom_activator(aumid: &str, guid: &str) {
+    // Normalise: ensure braces are present
+
+    // use windows::Win32::System::Registry::HKEY_CURRENT_USER;
+    use winreg::{enums::*, RegKey};
+    let guid_with_braces = if guid.starts_with('{') {
+        guid.to_string()
+    } else {
+        format!("{{{guid}}}")
+    };
+
+    let key_path = format!("Software\\Classes\\AppUserModelId\\{aumid}");
+
+    match RegKey::predef(HKEY_CURRENT_USER).create_subkey(&key_path) {
+        Ok((key, _disposition)) => match key.set_value("CustomActivator", &guid_with_braces) {
+            Ok(_) => {
+                log::info!(
+                    "[notification] CustomActivator → HKCU\\{}  =  {}",
+                    key_path,
+                    guid_with_braces
+                );
+            }
+            Err(e) => {
+                log::error!(
+                    "[notification] failed to write CustomActivator to HKCU\\{}: {}",
+                    key_path,
+                    e
+                );
+            }
+        },
+        Err(e) => {
+            log::error!(
+                "[notification] failed to open/create HKCU\\{}: {}",
+                key_path,
+                e
+            );
+        }
+    }
+}
+
 /// Delete an HKCU key and all its subkeys. Silently succeeds if absent.
 #[cfg(windows)]
 fn uninstall_key(subkey: &str) -> crate::Result<()> {

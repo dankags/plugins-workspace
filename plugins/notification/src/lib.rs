@@ -399,19 +399,72 @@ fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result
     Ok(())
 }
 
-fn pick_icon(icons: &[String]) -> Option<String> {
-    let mut png = None;
+/// Resolve the best available icon for the Windows notification registry
+/// (`IconUri`) from the bundle icon list.
+///
+/// # Icon preference order
+/// 1. `.ico`  — best: Windows natively understands ICO at all DPIs
+/// 2. `.png`  — fallback: Windows 10+ Action Center can display PNG
+/// 3. `None`  — no suitable icon found
+///
+/// # Path normalisation
+/// `std::fs::canonicalize` prepends `\\?\` (extended-length path prefix)
+/// which is valid for Win32 I/O but NOT for registry `IconUri` — the Action
+/// Center silently ignores paths that start with `\\?\`.
+///
+/// This function resolves to an absolute path and then strips any `\\?\`
+/// prefix before returning, giving Windows exactly the plain path it needs:
+/// `C:\Users\...\icons\icon.ico`
+#[cfg(windows)]
+fn pick_notification_icon<R: tauri::Runtime>(
+    icons: &[String],
+    app: &tauri::AppHandle<R>,
+) -> Option<String> {
+    // Prefer .ico; fall back to first .png
+    let chosen = icons
+        .iter()
+        .find(|i| i.ends_with(".ico"))
+        .or_else(|| icons.iter().find(|i| i.ends_with(".png")))?;
 
-    for icon in icons {
-        if icon.ends_with(".ico") {
-            return Some(icon.clone());
-        }
-        if icon.ends_with(".png") && png.is_none() {
-            png = Some(icon.clone());
-        }
+    // Resolve relative to the Tauri resource directory.
+    // In dev this is the project root; in a production install it is the
+    // resource directory next to the executable.
+    let resource_dir = app.path().resource_dir().ok()?;
+    let candidate = resource_dir.join(chosen);
+
+    if !candidate.exists() {
+        log::warn!(
+            "[notification] icon not found at {:?} — IconUri will be omitted",
+            candidate
+        );
+        return None;
     }
 
-    png
+    // canonicalize resolves symlinks and relative components but also adds
+    // the \\?\ prefix on Windows. Strip it so the registry value is a plain
+    // absolute path that Windows can display as a notification icon.
+    let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+    let path_str = canonical.to_string_lossy().into_owned();
+
+    // Strip \\?\ or \\?\UNC\ prefix
+    let clean = if let Some(stripped) = path_str.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", stripped) // \\?\UNC\server\share → \\server\share
+    } else if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
+        stripped.to_string() // \\?\C:\... → C:\...
+    } else {
+        path_str
+    };
+
+    log::debug!("[notification] resolved icon path: {}", clean);
+    Some(clean)
+}
+
+#[cfg(not(windows))]
+fn pick_notification_icon<R: tauri::Runtime>(
+    _icons: &[String],
+    _app: &tauri::AppHandle<R>,
+) -> Option<String> {
+    None
 }
 
 // ── Core plugin wiring ────────────────────────────────────────────────────────
@@ -441,7 +494,6 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
             {
                 let config: PluginConfig = api.config().clone();
                 app.manage(config.clone());
-
 
                 let app_name = app
                     .config()
@@ -590,38 +642,37 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
 
                 if let Some(ref guid_str) = config.com_server_guid {
 
+                    // ── Icon resolution ───────────────────────────────────
+                    // Pick the best icon from the bundle list and resolve it
+                    // to a plain absolute path WITHOUT the \\?\ prefix that
+                    // std::fs::canonicalize adds. Windows registry IconUri
+                    // must be a plain path — the \\?\ prefix causes the icon
+                    // to silently not load in the Action Center / toast.
+                    let icon_path = pick_notification_icon(
+                        &app.config().bundle.icon,
+                        &app,
+                    );
 
                     let reg_config = windows_platform::registry_installer::RegistryConfig {
                         com_server_guid: guid_str.clone(),
                         aumid: aumid.clone(),
                         display_name: display_name.clone(),
-                        icon_path: pick_icon(&app.config().bundle.icon)
-    .and_then(|icon| {
-        let dir = app.path().resource_dir().ok()?;
-        let path = dir.join(icon);
-        Some(path.to_string_lossy().into_owned())
-    }),
+                        icon_path,
                         exe_path: None,
                     };
-                    println!("app icons: {:?}", app.config().bundle.icon);
-                    println!("icons file_path: {:?}",  pick_icon(&app.config().bundle.icon)
-    .and_then(|icon| {
-        let dir = app.path().resource_dir().ok()?;
-        let path = dir.join(icon);
-        Some(path.to_string_lossy().into_owned())
-    }));
 
-                    // if let Err(e) =
-                    //     windows_platform::registry_installer::install(&reg_config)
-                    // {
-                    //     println!("[notification] Registry installation failed: {e}");
-                    //     log::error!("[notification] Registry installation failed: {e}");
-                    // }
+                    if let Err(e) =
+                        windows_platform::registry_installer::install(&reg_config)
+                    {
+                        log::error!("[notification] Registry installation failed: {e}");
+                    }
 
-                    match windows_platform::registry_installer::install(&reg_config) {
-    Ok(_) => println!("Registry install OK"),
-    Err(e) => println!("Registry install FAILED: {:?}", e),
-}
+                    // Write CustomActivator — the value that was missing.
+                    // Without it Windows shows toasts but never calls Activate().
+                    windows_platform::registry_installer::write_custom_activator(
+                        &aumid,
+                        guid_str,
+                    );
 
                     let shortcut_config =
                         windows_platform::shortcut_creator::ShortcutConfig {
@@ -634,7 +685,6 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     if let Err(e) = windows_platform::shortcut_creator::create_or_update(
                         &shortcut_config,
                     ) {
-                        println!("[notification] Shortcut creation failed: {e}");
                         log::warn!("[notification] Shortcut creation failed: {e}");
                     }
                 }
