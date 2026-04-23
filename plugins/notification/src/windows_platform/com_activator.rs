@@ -38,9 +38,8 @@ use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows_core::*;
 use windows_sys::Win32::Foundation::RPC_E_TOO_LATE;
 
-use crate::windows_platform::runtime_context::context;
-
 use crate::trace_event;
+use crate::windows_platform::runtime_context::context;
 
 static GLOBAL_REGISTRATION: OnceLock<Mutex<Option<ComRegistration>>> = OnceLock::new();
 
@@ -119,16 +118,48 @@ impl INotificationActivationCallback_Impl for NotificationActivator_Impl {
                 event.inputs.keys().collect::<Vec<_>>(),
             );
 
+            // Read the activation hint encoded by xml_builder into the args.
+            // "fg" = the user clicked a Foreground button (e.g. "Open") — the
+            //        app should be brought to focus.
+            // "bg" = the user clicked a Background button (e.g. "Send Reply")
+            //        or tapped the toast body — handle silently, no window.
+            // Body tap: no `activation` key → treat as "bg" (silent).
+            let raw_args_str = raw_args.as_str();
+            let is_foreground_action = raw_args_str.split('&').any(|p| p.trim() == "activation=fg");
+
             if is_background_activation_launch() {
-                // BACKGROUND PROCESS: the app has no webview / relay yet.
-                // Persist the activation to the encrypted queue so the worker
-                // thread can process it and emit it once the relay is ready.
-                let id = uuid::Uuid::new_v4().to_string();
-                crate::windows_platform::activation_queue::enqueue(id, event);
+                if is_foreground_action {
+                    // BACKGROUND PROCESS + FOREGROUND ACTION:
+                    // User clicked "Open" (or equivalent) while app was closed.
+                    // We need to bring the app to foreground. The background
+                    // process cannot do this itself — it is headless. Instead:
+                    // enqueue the event so the on_background handler receives
+                    // it, then the handler can decide how to re-launch
+                    // (e.g. open a URL, use tauri-plugin-single-instance, etc).
+                    // The app re-launch is the caller's responsibility via the
+                    // on_background handler — the plugin does not force a window.
+                    log::info!(
+                        "[notification] background process: foreground action — routing to handler"
+                    );
+                    let id = uuid::Uuid::new_v4().to_string();
+                    crate::windows_platform::activation_queue::enqueue(id, event);
+                } else {
+                    // BACKGROUND PROCESS + BACKGROUND ACTION:
+                    // Silent handling — no window, no focus change.
+                    // Persist to queue, worker dispatches to on_background handler.
+                    log::info!(
+                        "[notification] background process: background action — silent handling"
+                    );
+                    let id = uuid::Uuid::new_v4().to_string();
+                    crate::windows_platform::activation_queue::enqueue(id, event);
+                }
             } else {
-                // FOREGROUND PROCESS: relay thread is already running.
-                // Dispatch directly — no queue round-trip, no disk write,
-                // no latency. The app receives the event immediately.
+                // FOREGROUND PROCESS (app is running):
+                // Relay directly — no queue, no disk write.
+                // The frontend receives notification://action regardless of
+                // whether the action is fg or bg. If it is a Foreground action
+                // the app is already in focus so nothing extra is needed.
+                log::info!("[notification] foreground process: dispatching directly");
                 crate::windows_platform::action_handler::dispatch(event);
             }
         });

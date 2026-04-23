@@ -624,8 +624,33 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 }
 
                 // ── Background process path ───────────────────────────────
+                //
+                // When Windows spawns the app via ----BackgroundActivated it
+                // is a fully headless background worker. It must:
+                //   1. NOT show any window to the user
+                //   2. Receive Activate() from the COM pump thread
+                //   3. Run the on_background handler
+                //   4. Exit cleanly when the worker finishes
+                //
+                // Tauri opens the main window automatically during startup
+                // regardless of launch mode. We hide every window here
+                // immediately — before the Tauri event loop runs — so the
+                // user never sees a flash of the UI.
                 if is_bg {
-                    log::debug!("[notification] background activation process started");
+                    log::debug!("[notification] background activation process — hiding all windows");
+
+                    // Hide every window that Tauri may have created.
+                    // We iterate over all windows because the app may have
+                    // multiple webview windows configured.
+                    for (label, window) in app.webview_windows() {
+                        if let Err(e) = window.hide() {
+                            log::warn!(
+                                "[notification] failed to hide window {:?}: {}",
+                                label, e
+                            );
+                        }
+                    }
+
                     windows_platform::shutdown::spawn_background_exit_watcher(15);
                     return Ok(());
                 }
@@ -650,7 +675,7 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     // to silently not load in the Action Center / toast.
                     let icon_path = pick_notification_icon(
                         &app.config().bundle.icon,
-                        &app,
+                        app,
                     );
 
                     let reg_config = windows_platform::registry_installer::RegistryConfig {

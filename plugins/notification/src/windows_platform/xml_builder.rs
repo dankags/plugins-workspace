@@ -25,6 +25,47 @@ pub fn build(data: &NotificationData, ver: WindowsVersion) -> crate::Result<Stri
 
     // ── <toast> root ──────────────────────────────────────────────────────
     xml.push_str("<toast");
+
+    // ── <toast> root activationType ───────────────────────────────────────
+    //
+    // The `activationType` on the <toast> ROOT controls what happens when
+    // the user taps the BODY of the toast (not a button).
+    // Individual <action> elements have their own activationType.
+    //
+    // Rules:
+    //
+    // Case A — ALL actions are Background (or background_activation is set):
+    //   → emit activationType="background" on the root
+    //   → body tap goes through COM silently (no window focus)
+    //   → all buttons go through COM (correct — they are all Background)
+    //
+    // Case B — ANY action is Foreground (e.g. an "Open" button):
+    //   → do NOT emit activationType on the root
+    //   → body tap uses Windows default (brings app to foreground)
+    //   → each button uses its own activationType from the XML
+    //   → Background buttons still call Activate() via CustomActivator
+    //   → Foreground buttons bring the app to foreground (correct)
+    //
+    // Why: when activationType="background" is on the root, Windows routes
+    // ALL activations (body + ALL buttons) through COM regardless of what
+    // individual <action> elements say. This prevents Foreground buttons
+    // from actually bringing the app to focus.
+    let has_any_foreground = data
+        .windows_actions
+        .iter()
+        .any(|a| a.action_type == crate::models::WindowsActionType::Foreground);
+    let has_any_background = data.background_activation
+        || data
+            .windows_actions
+            .iter()
+            .any(|a| a.action_type == crate::models::WindowsActionType::Background);
+
+    // Only put background on the root when there are background actions
+    // AND no foreground actions would be overridden by it.
+    if has_any_background && !has_any_foreground && ver.has_actions() {
+        xml.push_str(" activationType=\"background\"");
+    }
+
     if ver.has_scenario() {
         if let Some(ref s) = data.scenario {
             let scenario_str = match s {
@@ -183,10 +224,10 @@ pub fn build(data: &NotificationData, ver: WindowsVersion) -> crate::Result<Stri
                 WindowsActionType::Foreground => "foreground",
             };
 
-            // Protocol actions use the URI verbatim; others encode as key=value
-            // so Activate() can recover action_id, tag, and group.
-            // Non-protocol actions always use action.id directly, even if a
-            // protocol field happens to be set on the action.
+            // Encode activation type into the arguments string so Activate()
+            // can determine the correct routing even when the app is closed.
+            // Without this, Activate() in the background process cannot tell
+            // whether to silently handle the action or re-launch the app.
             let args = if action.action_type != WindowsActionType::Protocol {
                 let mut parts = vec![format!("action={}", esc(&action.id))];
                 if let Some(ref tag) = data.tag {
@@ -195,7 +236,14 @@ pub fn build(data: &NotificationData, ver: WindowsVersion) -> crate::Result<Stri
                 if let Some(ref group) = data.group {
                     parts.push(format!("group={}", esc(group)));
                 }
-                // Join with XML-encoded & so the attribute value stays valid.
+                // Encode the activation type so Activate() can route correctly.
+                // "fg" = this action should bring the app to foreground.
+                // "bg" = this action should be processed silently in background.
+                let activation_hint = match action.action_type {
+                    WindowsActionType::Foreground => "fg",
+                    _ => "bg",
+                };
+                parts.push(format!("activation={activation_hint}"));
                 parts.join("&amp;")
             } else {
                 action.protocol.as_deref().unwrap_or(&action.id).to_string()
