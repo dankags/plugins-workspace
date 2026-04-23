@@ -7,7 +7,7 @@ use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone)]
 pub struct ActivationContext {
-    pub app_name: String,
+    // pub app_name: String,
     pub guid: String,
     pub storage_dir: PathBuf,
 }
@@ -24,12 +24,9 @@ fn slot() -> &'static Mutex<Option<ActivationContext>> {
 ///
 /// Safe to call multiple times — subsequent calls overwrite the value.
 /// Required for test isolation where every test calls setup().
-pub fn init_context(app_name: String, guid: String, storage_dir: PathBuf) {
-    *slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(ActivationContext {
-        app_name,
-        guid,
-        storage_dir,
-    });
+pub fn init_context(guid: String, storage_dir: PathBuf) {
+    *slot().lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(ActivationContext { guid, storage_dir });
 }
 
 /// Return a cheap clone of the context.

@@ -59,10 +59,10 @@ use std::{
     collections::{HashSet, VecDeque},
     fs,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Condvar, LazyLock, Mutex,
+        Condvar, LazyLock, Mutex,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -104,13 +104,15 @@ impl QueueState {
 }
 
 // ── Global state ──────────────────────────────────────────────────────────────
-
+#[allow(clippy::incompatible_msrv)]
 static STATE: LazyLock<Mutex<QueueState>> = LazyLock::new(|| Mutex::new(QueueState::new()));
 
+#[allow(clippy::incompatible_msrv)]
 // Condvar wakes the worker thread immediately when an item is enqueued.
 // Paired with the STATE mutex.
 static WAKE: LazyLock<Condvar> = LazyLock::new(Condvar::new);
 
+#[allow(clippy::incompatible_msrv)]
 // Condvar + flag for the persist thread.
 static DIRTY: LazyLock<(Mutex<bool>, Condvar)> =
     LazyLock::new(|| (Mutex::new(false), Condvar::new()));
@@ -172,15 +174,15 @@ fn decrypt(blob: &[u8], guid: &str) -> Option<Vec<u8>> {
 
 // ── File paths ────────────────────────────────────────────────────────────────
 
-fn queue_file(dir: &PathBuf) -> PathBuf {
+fn queue_file(dir: &Path) -> PathBuf {
     dir.join("activation_queue.bin") // binary encrypted blob
 }
 
-fn queue_tmp_file(dir: &PathBuf) -> PathBuf {
+fn queue_tmp_file(dir: &Path) -> PathBuf {
     dir.join("activation_queue.bin.tmp")
 }
 
-fn journal_file(dir: &PathBuf) -> PathBuf {
+fn journal_file(dir: &Path) -> PathBuf {
     dir.join("activation_queue.journal")
 }
 
@@ -285,7 +287,7 @@ pub fn load_queue() {
 
     println!("Initializing the load_queue");
     println!("Storage directory: {:?}", dir);
-    print!("GUID: {} ({} bytes)\n", guid, guid.as_bytes().len());
+    println!("GUID: {} ({} bytes)\n", guid, guid.len());
 
     let path = queue_file(&dir);
     if !path.exists() {
@@ -641,7 +643,6 @@ mod tests {
         WAKE.notify_all();
 
         runtime_context::init_context(
-            "TestApp".into(),
             "00000000-0000-0000-0000-000000000000".into(),
             std::env::temp_dir().join("notification_test_storage"),
         );

@@ -18,7 +18,7 @@
 pub mod action_handler;
 pub mod activation_bridge;
 pub mod activation_queue;
-pub mod background_activation;
+// pub mod background_activation;
 pub mod com_activator;
 pub mod notification_listener;
 pub mod registry_installer;

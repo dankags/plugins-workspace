@@ -121,6 +121,7 @@ pub fn parse_activation_uri(raw: &str) -> ActivationEvent {
 ///
 /// Called when Windows delivers the toast body-tap or foreground button click
 /// through the deep-link path while the app is already running.
+#[warn(dead_code)]
 pub fn parse_foreground_args(raw: &str) -> ActivationEvent {
     parse_query(raw, ActivationSource::Foreground)
 }

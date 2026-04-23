@@ -286,6 +286,7 @@ fn uninstall_key(subkey: &str) -> crate::Result<()> {
             return Ok(());
         }
 
+        #[warn(clippy::needless_return)]
         // Real failure
         return Err(crate::Error::Windows(format!(
             "RegDeleteTreeW({subkey}) failed: {status:?}"

@@ -549,7 +549,6 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                 })?;
 
                 windows_platform::runtime_context::init_context(
-                    app_name.clone(),
                     guid_str.clone(),
                     storage_dir,
                 );

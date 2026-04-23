@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows::Win32::System::Services::{OpenSCManagerW, SC_MANAGER_CONNECT};
 use windows::{
     core::{Error, GUID, HRESULT},
     Win32::Foundation::*,
@@ -278,8 +277,8 @@ pub fn initialize_com_security() -> windows::core::Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadingModel {
-    STA,
-    MTA,
+    Sta,
+    Mta,
 }
 
 pub fn current_threading_model() -> windows::core::Result<ThreadingModel> {
@@ -290,8 +289,8 @@ pub fn current_threading_model() -> windows::core::Result<ThreadingModel> {
         CoGetApartmentType(&mut apt, &mut qual)?;
 
         match apt {
-            APTTYPE_STA => Ok(ThreadingModel::STA),
-            _ => Ok(ThreadingModel::MTA),
+            APTTYPE_STA => Ok(ThreadingModel::Sta),
+            _ => Ok(ThreadingModel::Mta),
         }
     }
 }
@@ -433,17 +432,6 @@ pub fn run_pump_with_cancel(timeout_ms: u32, cancel: CancelToken) {
 }
 
 // ============================================================
-// Service Mode Detection
-// ============================================================
-
-pub fn is_service_mode() -> bool {
-    unsafe {
-        let scm = OpenSCManagerW(None, None, SC_MANAGER_CONNECT);
-        scm.is_err()
-    }
-}
-
-// ============================================================
 // COM Guard (RAII)
 // ============================================================
 
@@ -530,7 +518,7 @@ pub fn register(clsid: &GUID, factory: &IUnknown) -> windows::core::Result<ComRe
     // CoRegisterClassObject with the appropriate HRESULT if it truly cannot
     // work, giving a clear error rather than a misleading threading-model one.
     if guard.initialized_here {
-        validate_threading_model(ThreadingModel::STA)?;
+        validate_threading_model(ThreadingModel::Sta)?;
     }
 
     let cookie =
@@ -623,7 +611,8 @@ pub fn parse_guid(s: &str) -> windows::core::Result<GUID> {
 // ============================================================
 // Launch detection
 // ============================================================
-
+/// Returns `true` when this process was launched by Windows for a background
+/// COM toast activation (`----BackgroundActivated` is present in argv).
 pub fn is_background_activation_launch() -> bool {
     std::env::args().any(|a| a == "----BackgroundActivated")
 }

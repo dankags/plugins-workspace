@@ -177,7 +177,7 @@ fn play_file(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error + S
     // Build the output stream. OutputStreamBuilder selects the default output
     // device automatically. The stream must stay alive while the sink plays.
     let stream = rodio::OutputStreamBuilder::open_default_stream()?;
-    let sink = rodio::Sink::connect_new(&stream.mixer());
+    let sink = rodio::Sink::connect_new(stream.mixer());
 
     // Decode from the in-memory buffer.
     let cursor = Cursor::new(bytes);

@@ -50,7 +50,7 @@ use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::{
     models::NotificationActionEvent, trace_event,
-    windows_platform::background_activation::is_background_activation_launch,
+    windows_platform::com_activator::is_background_activation_launch,
 };
 
 /// The Tauri event name emitted when a notification action fires.
@@ -111,10 +111,10 @@ pub fn dispatch(event: NotificationActionEvent) {
         event.tag,
         event.group,
     );
-    println!("[notification] dispatch: action_id={:?} tag={:?} group={:?}",
-        event.action_id,
-        event.tag,
-        event.group,);
+    println!(
+        "[notification] dispatch: action_id={:?} tag={:?} group={:?}",
+        event.action_id, event.tag, event.group,
+    );
     // ── Step 1: background handler ────────────────────────────────────────
     let should_call_handler = is_background_activation_launch() || cfg!(test);
 
@@ -148,9 +148,11 @@ pub fn dispatch(event: NotificationActionEvent) {
                      Register a handler with init().on_background(f) or ensure \
                      start_relay() is called."
                 );
-                println!("[notification] event dropped — no background handler and no relay. \
+                println!(
+                    "[notification] event dropped — no background handler and no relay. \
                      Register a handler with init().on_background(f) or ensure \
-                     start_relay() is called.");
+                     start_relay() is called."
+                );
             } else {
                 log::debug!("[notification] no relay — background handler handled the event");
                 println!("[notification] no relay — background handler handled the event");
@@ -195,8 +197,10 @@ pub fn start_relay<R: Runtime>(app: AppHandle<R>) {
                     "[notification] relaying event: action_id={}",
                     event.action_id
                 );
-                 println!("[notification] relaying event: action_id={}",
-                    event.action_id);
+                println!(
+                    "[notification] relaying event: action_id={}",
+                    event.action_id
+                );
                 if let Err(e) = app.emit(EVENT_NAME, &event) {
                     log::error!("[notification] failed to emit action event: {e}");
                     println!("[notification] failed to emit action event: {e}");
