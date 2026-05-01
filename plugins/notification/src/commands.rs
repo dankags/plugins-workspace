@@ -5,7 +5,6 @@
 use tauri::{command, plugin::PermissionState, AppHandle, Runtime, State};
 
 #[cfg(windows)]
-use crate::windows_platform::registry_installer::RegistryConfig;
 use crate::{Notification, NotificationData, Result};
 
 #[command]
@@ -202,48 +201,4 @@ pub async fn remove_notification_shortcut<R: Runtime>(
             .map_err(|e| e.to_string())?;
     }
     Ok(())
-}
-
-#[cfg(windows)]
-pub fn uninstall(aumid: String, guid: String) -> crate::Result<()> {
-    uninstall_key(&format!("Software\\Classes\\CLSID\\{}", guid))?;
-    uninstall_key(&format!("Software\\Classes\\AppUserModelId\\{}", aumid))?;
-    log::info!(
-        "[notification] registry uninstalled — AUMID={} COM={}",
-        aumid,
-        guid
-    );
-    Ok(())
-}
-
-/// Delete an HKCU key and all its subkeys. Silently succeeds if absent.
-#[cfg(windows)]
-fn uninstall_key(subkey: &str) -> crate::Result<()> {
-    use windows::{
-        core::HSTRING,
-        Win32::{
-            Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
-            System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER},
-        },
-    };
-
-    unsafe {
-        let status = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(subkey));
-
-        // Success → return
-        if status == ERROR_SUCCESS {
-            return Ok(());
-        }
-
-        // Key missing → allowed
-        if status == ERROR_FILE_NOT_FOUND {
-            return Ok(());
-        }
-
-        #[warn(clippy::needless_return)]
-        // Real failure
-        return Err(crate::Error::Windows(format!(
-            "RegDeleteTreeW({subkey}) failed: {status:?}"
-        )));
-    }
 }
