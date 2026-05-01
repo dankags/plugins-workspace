@@ -4,6 +4,8 @@
 
 use tauri::{command, plugin::PermissionState, AppHandle, Runtime, State};
 
+#[cfg(windows)]
+use crate::windows_platform::registry_installer::RegistryConfig;
 use crate::{Notification, NotificationData, Result};
 
 #[command]
@@ -146,71 +148,102 @@ pub(crate) async fn get_active_notifications<R: Runtime>(
 ///
 /// Call this from your app's uninstaller — not on normal exit.
 /// Requires `comServerGuid` to be present in the plugin config.
-#[command]
-pub(crate) async fn uninstall_notification_registration<R: Runtime>(
+#[tauri::command]
+pub async fn uninstall_notification_registration<R: Runtime>(
     app: AppHandle<R>,
-) -> Result<()> {
+) -> std::result::Result<(), String> {
     #[cfg(windows)]
     {
-        use crate::windows_platform::registry_installer;
         use tauri::Manager;
 
-        let config = app
-            .try_state::<crate::PluginConfig>()
-            .map(|s: tauri::State<crate::PluginConfig>| s.inner().clone())
-            .unwrap_or_default();
-
-        let guid_str: String = match config.com_server_guid {
-            Some(g) => g,
-            None => return Ok(()),
-        };
+        let config = app.state::<crate::PluginConfig>().inner().clone();
 
         let aumid = app.config().identifier.clone();
-        let display_name = app
-            .config()
-            .product_name
-            .clone()
-            .unwrap_or_else(|| aumid.clone());
 
-        let reg_config = registry_installer::RegistryConfig {
-            com_server_guid: guid_str,
-            aumid,
-            display_name,
-            icon_path: None,
-            exe_path: None,
+        let guid_str = match config.com_server_guid {
+            Some(ref g) => g.clone(),
+            None => {
+                log::warn!("[notification] uninstall called but no comServerGuid configured");
+                return Ok(());
+            }
         };
 
-        registry_installer::uninstall(&reg_config)?;
-        Ok(())
+        crate::windows_platform::registry_installer::uninstall(&aumid, &guid_str)
+            .map_err(|e| e.to_string())?;
+
+        log::info!(
+            "[notification] registry keys removed for aumid={} guid={}",
+            aumid,
+            guid_str
+        );
     }
-    #[cfg(not(windows))]
-    {
-        let _ = app;
-        Ok(())
-    }
+
+    Ok(())
 }
 
-/// Remove the Start Menu shortcut written during install.
+/// Remove the Start Menu shortcut for this app.
 ///
-/// Call this from your app's uninstaller — not on normal exit.
-#[command]
-pub(crate) async fn remove_notification_shortcut<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+/// ```typescript
+/// await invoke('plugin:notification|remove_notification_shortcut');
+/// ```
+#[tauri::command]
+pub async fn remove_notification_shortcut<R: Runtime>(
+    app: AppHandle<R>,
+) -> std::result::Result<(), String> {
     #[cfg(windows)]
     {
-        use crate::windows_platform::shortcut_creator;
-
         let display_name = app
             .config()
             .product_name
             .clone()
             .unwrap_or_else(|| app.config().identifier.clone());
 
-        shortcut_creator::remove(&display_name)?;
-        Ok(())
+        crate::windows_platform::shortcut_creator::remove(&display_name)
+            .map_err(|e| e.to_string())?;
     }
-    #[cfg(not(windows))]
-    {
-        let _ = app;
-        Ok(())
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn uninstall(aumid: String, guid: String) -> crate::Result<()> {
+    uninstall_key(&format!("Software\\Classes\\CLSID\\{}", guid))?;
+    uninstall_key(&format!("Software\\Classes\\AppUserModelId\\{}", aumid))?;
+    log::info!(
+        "[notification] registry uninstalled — AUMID={} COM={}",
+        aumid,
+        guid
+    );
+    Ok(())
+}
+
+/// Delete an HKCU key and all its subkeys. Silently succeeds if absent.
+#[cfg(windows)]
+fn uninstall_key(subkey: &str) -> crate::Result<()> {
+    use windows::{
+        core::HSTRING,
+        Win32::{
+            Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
+            System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER},
+        },
+    };
+
+    unsafe {
+        let status = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(subkey));
+
+        // Success → return
+        if status == ERROR_SUCCESS {
+            return Ok(());
+        }
+
+        // Key missing → allowed
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(());
+        }
+
+        #[warn(clippy::needless_return)]
+        // Real failure
+        return Err(crate::Error::Windows(format!(
+            "RegDeleteTreeW({subkey}) failed: {status:?}"
+        )));
     }
 }

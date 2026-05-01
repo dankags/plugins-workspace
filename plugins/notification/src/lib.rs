@@ -448,9 +448,9 @@ fn pick_notification_icon<R: tauri::Runtime>(
 
     // Strip \\?\ or \\?\UNC\ prefix
     let clean = if let Some(stripped) = path_str.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{}", stripped) // \\?\UNC\server\share → \\server\share
+        format!(r"\\{}", stripped)
     } else if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
-        stripped.to_string() // \\?\C:\... → C:\...
+        stripped.to_owned()
     } else {
         path_str
     };
@@ -665,6 +665,19 @@ fn build_tauri_plugin<R: Runtime>() -> TauriPlugin<R, PluginConfig> {
                     .unwrap_or_else(|| aumid.clone());
 
                 if let Some(ref guid_str) = config.com_server_guid {
+
+                    // ── Stale registration detection ──────────────────────
+                    // If the LocalServer32 path in the registry points to an
+                    // exe that no longer exists, a previous uninstall was
+                    // unclean (registry not cleaned up). Remove the stale
+                    // keys now so they don't interfere with this install.
+                    if windows_platform::registry_installer::is_registration_stale(guid_str) {
+                        log::info!("[notification] stale COM registration detected — cleaning up");
+                        let _ = windows_platform::registry_installer::uninstall(
+                            &aumid,
+                            guid_str,
+                        );
+                    }
 
                     // ── Icon resolution ───────────────────────────────────
                     // Pick the best icon from the bundle list and resolve it
